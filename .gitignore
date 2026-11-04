@@ -1,0 +1,22 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller 构建产物（35MB 单文件 exe 不入库，见 README 第六节）
+build/
+build_probe/
+dist/
+
+# 本机运行状态与缓存（由程序自动生成）
+data/config.json
+data/runtime.json
+data/names.json
+data/resolved.json
+data/stockbar.log
+
+# 临时截图 / 调试目录
+.screenshots/
+check_edge_light.png
+compare_rotate.png
+compare_glitch.png

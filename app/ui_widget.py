@@ -1,0 +1,1190 @@
+"""任务栏悬浮小组件窗口（无边框、置顶、逐像素 alpha 的分层窗口）。"""
+from __future__ import annotations
+
+import json
+import time
+import tkinter as tk
+from collections import deque
+from typing import List, Optional
+
+from .config import RUNTIME_PATH
+from .platform_win import (
+    LayeredSurface,
+    apply_no_activate,
+    apply_tool_window,
+    cursor_pos,
+    hwnd_of_toplevel,
+    monitor_from_point,
+    monitors,
+    raise_topmost,
+    screen_luminance,
+    taskbar_layout,
+    virtual_screen,
+    window_rect,
+    work_area,
+)
+from .ui_common import FONT_FAMILY, SCALE, palette, px
+from .ui_render import Frame, draw_arrow, draw_spark, text_width
+
+TREND_W, TREND_H = 220, 40
+MINI_W, MINI_H = 104, 38
+GAP = 8
+TRAY_GAP = 6          # 与托盘之间留的间距
+EDGE_GAP = 4          # 与任务栏按钮区之间留的间距
+BUTTON_SAFE = 44      # Win11 按钮有 XAML 悬停/点击区，ReBar 矩形偏窄，额外让出
+MIN_TREND_W = 168     # 走势卡片再窄就放不下曲线与价格
+MIN_MINI_W = 78
+BREADTH_W = 132       # 涨跌家数卡片理想宽度
+MIN_BREADTH_W = 96    # 三列数字放得下的最小宽度
+MAX_BREADTH_W = 200
+
+# 100% 基准字号（最终值见 README「字号表」）
+NAME_FS = 11.5        # 名称（两种模式共用）
+MINI_PCT_FS = 16      # 迷你模式涨跌幅（主信息，加粗）
+PRICE_FS = 18         # 走势模式现价（最大）
+PCT_FS = 12.5         # 走势模式涨跌幅（次大）
+BREADTH_LABEL_FS = 10.5  # 涨/跌/平 标签（单字 CJK 在 8px 以下会糊成色块）
+BREADTH_NUM_FS = 11.5   # 家数数字，与名称同级
+
+SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.6, 1.4, 0.1
+
+
+class WidgetWindow:
+    def __init__(self, app) -> None:
+        self.app = app
+        self.store = app.store
+        self.cfg = app.cfg
+        self.events: deque = deque()
+        self.page = 0
+        self._size = (0, 0)
+        self._visible: List[str] = []
+        self._last_sig = None
+        self._drag = None
+        self._drag_moved = False
+        self._next_rotate = time.time() + max(1, int(self.cfg["display"]["rotate_seconds"]))
+        self._tick_id = None
+        self._layout = None
+        self._mon: Optional[dict] = None
+        self._dpi_mul = 1.0
+        self._dark = True
+        self._pal = palette(True)
+        self._dock_ok = False
+        self._count_limit = 3
+        self.scale = max(0.6, min(1.4, float(self.cfg["window"].get("scale", 0.8))))
+        self._card_w = self.s(TREND_W)
+        self._breadth_w = self.s(BREADTH_W)
+        self._show_breadth = True
+        self._ch = self.s(TREND_H)
+        self._x = self._y = 0
+        self._anchor = (0, 0)
+        self._last_geo_check = 0.0
+        self._last_theme_check = 0.0
+        self._menu = None
+        self._toast: Optional[tuple] = None
+        self.surface: Optional[LayeredSurface] = None
+
+        self.win = tk.Toplevel(app.root)
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        # 视觉完全由 UpdateLayeredWindow 提交的 RGBA 位图决定，窗口自身不透明
+        self.win.configure(bg="#000000")
+        self.win.attributes("-topmost", bool(self.cfg["window"]["always_on_top"]))
+
+        self.canvas = tk.Canvas(
+            self.win, bg="#000000", bd=0, highlightthickness=0, cursor="hand2"
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # 分层窗口在 alpha=0 的像素上会被系统判定为点击穿透，另叠一层
+        # alpha≈0.4% 的命中层来接收拖动/点击/右键/滚轮，视觉上不可见。
+        self.hit = tk.Toplevel(app.root)
+        self.hit.withdraw()
+        self.hit.overrideredirect(True)
+        self.hit.configure(bg="#000000", cursor="hand2")
+        self.hit.attributes("-topmost", bool(self.cfg["window"]["always_on_top"]))
+        try:
+            self.hit.attributes("-alpha", 0.004)
+        except Exception:
+            pass
+        for seq, handler in (
+            ("<Button-1>", self._on_press),
+            ("<B1-Motion>", self._on_drag),
+            ("<ButtonRelease-1>", self._on_release),
+            ("<Button-3>", self._on_right_click),
+            ("<MouseWheel>", self._on_wheel),
+        ):
+            self.hit.bind(seq, handler)
+
+        self._mode_var = tk.StringVar(value=self.cfg["display"]["mode"])
+        self._count_var = tk.IntVar(value=self.cfg["display"]["visible_count"])
+        self._provider_var = tk.StringVar(value=self.cfg["data"]["provider"])
+
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+
+    # ------------------------------------------------------------- lifecycle
+    def s(self, value: float, minimum: int = 1) -> int:
+        """显示器 DPI + 用户整体缩放后的像素值。"""
+        return max(minimum, int(round(px(value) * self.scale * self._dpi_mul)))
+
+    def _p(self, value: float) -> int:
+        """只按显示器 DPI 换算的物理像素（间距/边距用）。"""
+        return max(1, int(round(px(value) * self._dpi_mul)))
+
+    def _fs(self, base: float) -> float:
+        return max(7.0, round(base * self.scale * self._dpi_mul, 1))
+
+    # ------------------------------------------------------------ multi-screen
+    def _primary_monitor(self, mons: list) -> Optional[dict]:
+        return next((m for m in mons if m.get("primary")), mons[0] if mons else None)
+
+    @staticmethod
+    def _same_monitor(a: Optional[dict], b: Optional[dict]) -> bool:
+        if not a or not b:
+            return False
+        return (a.get("device") == b.get("device")
+                and a.get("rect") == b.get("rect")
+                and abs(float(a.get("dpi") or 1.0) - float(b.get("dpi") or 1.0)) < 0.01)
+
+    def _apply_monitor(self, mon: Optional[dict]) -> None:
+        self._mon = mon
+        dpi = float((mon or {}).get("dpi") or SCALE)
+        self._dpi_mul = max(0.5, min(3.0, dpi / max(0.1, SCALE)))
+
+    def _monitor_center(self) -> tuple:
+        if not self._mon:
+            return cursor_pos()
+        r = self._mon["rect"]
+        return ((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)
+
+    def _pick_saved_monitor(self, mons: list) -> tuple:
+        """按配置里的设备名/显示器矩形还原；都没有则主屏。
+
+        返回 (显示器, 是否原显示器已断开)。
+        """
+        win = self.cfg["window"]
+        device = str(win.get("monitor") or "")
+        hint = win.get("monitor_rect") or []
+        if device:
+            for mon in mons:
+                if mon.get("device") == device:
+                    return mon, False
+        if isinstance(hint, (list, tuple)) and len(hint) == 4:
+            try:
+                rect = [int(v) for v in hint]
+            except (TypeError, ValueError):
+                rect = []
+            for mon in mons:
+                if list(mon["rect"]) == rect:
+                    return mon, False
+        lost = bool(device or hint)
+        return self._primary_monitor(mons), lost
+
+    def _forget_monitor(self) -> None:
+        """配置的显示器不在了：清掉记忆并回到主屏的安全落点。"""
+        win = self.cfg["window"]
+        win["monitor"] = ""
+        win["monitor_rect"] = []
+        win["offset_x"] = 0
+        win["offset_y"] = 0
+        try:
+            self.store.save()
+        except Exception:
+            pass
+
+    def _monitor_for_start(self) -> None:
+        mons = monitors()
+        mon, lost = self._pick_saved_monitor(mons)
+        self._apply_monitor(mon)
+        if lost:
+            self._forget_monitor()
+
+    def _follow_monitor(self) -> bool:
+        """轮询时确认当前显示器仍在；断开则回主屏。返回屏幕是否发生变化。"""
+        mons = monitors()
+        device = (self._mon or {}).get("device") or ""
+        mon = None
+        if device:
+            mon = next((m for m in mons if m.get("device") == device), None)
+        disconnected = bool(device) and mon is None
+        if mon is None:
+            mon = self._primary_monitor(mons)
+        old = self._mon
+        changed = not self._same_monitor(old, mon)
+        self._apply_monitor(mon)
+        if disconnected:
+            self._forget_monitor()
+            changed = True
+        return changed
+
+    def show(self) -> None:
+        self._monitor_for_start()
+        self._replan()
+        w, h = self._preferred_size()
+        ax, ay = self._dock_anchor(w, h)
+        self._anchor = (ax, ay)
+        self._x = ax + int(self.cfg["window"].get("offset_x") or 0)
+        self._y = ay + int(self.cfg["window"].get("offset_y") or 0)
+        self._clamp_position(w, h)
+        self._size = (w, h)
+        self._pick_theme()
+        self.win.geometry(f"{w}x{h}+{self._x}+{self._y}")
+        self.win.deiconify()
+        self.win.update_idletasks()
+        self.win.update()
+        apply_tool_window(self.win)
+        apply_no_activate(self.win)
+        apply_tool_window(self.hit)
+        apply_no_activate(self.hit)
+        self.surface = LayeredSurface(hwnd_of_toplevel(self.win))
+        self._sync_hit(w, h)
+        if self.cfg["window"]["always_on_top"]:
+            raise_topmost(self.win)
+            raise_topmost(self.hit)
+        self._render_now()
+        self._write_runtime()
+        self._tick()
+
+    def destroy(self) -> None:
+        self._close_menu()
+        for window in (self.hit, self.win):
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    def _sync_hit(self, w: int, h: int) -> None:
+        """命中层与可见层保持同一矩形。"""
+        try:
+            self.hit.geometry(f"{w}x{h}+{self._x}+{self._y}")
+            if self.hit.state() == "withdrawn":
+                self.hit.deiconify()
+        except Exception:
+            pass
+
+    def _apply_geometry(self, w: int, h: int) -> None:
+        """改尺寸后先让 Tk 真正应用新几何，再提交分层位图。"""
+        self.win.geometry(f"{w}x{h}+{self._x}+{self._y}")
+        self.canvas.configure(width=w, height=h)
+        self._sync_hit(w, h)
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- config
+    def apply_config(self) -> None:
+        self.cfg = self.app.cfg
+        display = self.cfg["display"]
+        self._mode_var.set(display["mode"])
+        self._count_var.set(display["visible_count"])
+        self._provider_var.set(self.cfg["data"]["provider"])
+        self.win.attributes("-topmost", bool(self.cfg["window"]["always_on_top"]))
+        self.page = 0
+        self._next_rotate = time.time() + max(1, display["rotate_seconds"])
+        self._last_sig = None
+        if self._mon is None:
+            self._monitor_for_start()
+        else:
+            self._follow_monitor()   # 显示器还在就留在原屏，不抢回主屏
+        self._replan()
+        w, h = self._preferred_size()
+        ax, ay = self._dock_anchor(w, h)
+        self._anchor = (ax, ay)
+        self._x = ax + int(self.cfg["window"].get("offset_x") or 0)
+        self._y = ay + int(self.cfg["window"].get("offset_y") or 0)
+        self._clamp_position(w, h)
+        self._size = (w, h)
+        self._apply_geometry(w, h)
+        self._pick_theme()
+        self._render_now()
+        self._write_runtime()
+
+    # ----------------------------------------------------------------- layout
+    def _band(self) -> Optional[tuple]:
+        """托盘左侧的可用条带 (left, right, taskbar_rect)，不可用则 None。"""
+        layout = self._layout
+        if not layout or layout.get("autohide"):
+            return None
+        if layout.get("orientation") not in ("bottom", "top"):
+            return None
+        tb = layout["rect"]
+        tray = layout.get("tray")
+        right = (tray[0] if tray else tb[2]) - self._p(TRAY_GAP)
+        left = layout["occupied_right"] + self._p(EDGE_GAP + BUTTON_SAFE)
+        if right - left < self._p(120):
+            return None
+        return left, right, tb
+
+    def _replan(self) -> None:
+        """按缩放值、显示模式与任务栏可用空间决定尺寸。
+
+        迷你模式只显示「名称 + 涨跌幅」，涨跌家数卡片完全不参与布局，
+        腾出来的宽度还给窗口；走势模式才会挂上涨跌家数。
+        """
+        if self._mon is None:
+            self._apply_monitor(self._primary_monitor(monitors()))
+        self._layout = taskbar_layout(point=self._monitor_center())
+        band = self._band()
+        cfg = self.cfg
+        mode = cfg["display"]["mode"]
+        self.scale = max(0.6, min(1.4, float(cfg["window"].get("scale", 0.8))))
+        gap = self.s(GAP, 2)
+        total = len(self.store.cfg["watchlist"])
+        rotate = bool(cfg["display"].get("rotate_enabled", True))
+        wanted = max(1, min(int(cfg["display"]["visible_count"]), total, 3)) if total else 0
+        if not rotate and wanted:
+            wanted = 1
+        show_b = bool(cfg["display"].get("show_breadth", True)) and mode == "trend"
+        self._show_breadth = show_b
+        base_h = MINI_H if mode == "mini" else TREND_H
+
+        if band:
+            left, right, tb = band
+            self._dock_ok = True
+            self._ch = min(tb[3] - tb[1], self.s(base_h, 22))
+            avail = right - left
+            max_width = int(cfg["window"].get("max_width") or 0)
+            if max_width > 0:
+                avail = min(avail, self._p(max_width))
+            base_w = self.s(MINI_W if mode == "mini" else TREND_W)
+            min_w = self.s(MIN_MINI_W if mode == "mini" else MIN_TREND_W)
+            base_b = self.s(BREADTH_W)
+            min_b = self.s(MIN_BREADTH_W)
+            if total == 0:
+                self._count_limit = 0
+                self._card_w = 0
+                self._breadth_w = min(base_b, avail) if show_b else 0
+                if not show_b or self._breadth_w < min_b:
+                    self._show_breadth = False
+                    self._breadth_w = 0
+                return
+            if avail < min_w:
+                self._dock_ok = False
+            else:
+                count = wanted
+                card_w = base_w
+                breadth_w = base_b if show_b else 0
+                while True:
+                    if show_b:
+                        need = count * base_w + base_b + count * gap
+                        if need <= avail:
+                            card_w, breadth_w = base_w, base_b
+                            break
+                        candidate = (avail - base_b - count * gap) // count
+                        if candidate >= min_w:
+                            card_w, breadth_w = candidate, base_b
+                            break
+                    else:
+                        need = count * base_w + (count - 1) * gap
+                        if need <= avail:
+                            card_w = base_w
+                            break
+                        candidate = (avail - (count - 1) * gap) // count
+                        if candidate >= min_w:
+                            card_w = candidate
+                            break
+                    if count > 1:
+                        count -= 1
+                        continue
+                    # 只剩 1 只：优先保住股票卡，剩多少给涨跌卡
+                    if show_b and avail >= base_w + gap + min_b:
+                        card_w = base_w
+                        breadth_w = max(min_b, min(avail - card_w - gap,
+                                                    self.s(MAX_BREADTH_W)))
+                    elif show_b and avail >= min_w + gap + min_b:
+                        card_w = avail - gap - min_b
+                        breadth_w = min_b
+                    elif show_b:
+                        # 空间连"股票 + 最小涨跌卡"都放不下 → 隐藏涨跌卡
+                        self._show_breadth = False
+                        show_b = False
+                        breadth_w = 0
+                        card_w = max(min_w, avail)
+                    else:
+                        card_w = max(min_w, avail)
+                    break
+                self._count_limit = count
+                self._card_w = card_w
+                self._breadth_w = breadth_w
+                return
+
+        # 降级：侧边/顶部任务栏、自动隐藏、空间过窄 → 浮在工作区右下角
+        self._dock_ok = False
+        self._count_limit = wanted
+        self._card_w = self.s(MINI_W if mode == "mini" else TREND_W)
+        self._breadth_w = self.s(BREADTH_W) if show_b else 0
+        self._ch = self.s(base_h, 22)
+
+    def _card_size(self) -> tuple:
+        return self._card_w, self._ch
+
+    def _preferred_size(self, count: Optional[int] = None) -> tuple:
+        cw, ch = self._card_size()
+        gap = self.s(GAP, 2)
+        count = self._visible_count() if count is None else count
+        count = max(0, count)
+        if count == 0:
+            if self._show_breadth and self._breadth_w > 0:
+                return self._breadth_w, max(self.s(36), ch)
+            return self.s(200), max(self.s(36), ch)
+        width = count * cw + (count - 1) * gap
+        if self._show_breadth and self._breadth_w > 0:
+            width += gap + self._breadth_w
+        return width, ch
+
+    def _visible_count(self) -> int:
+        total = len(self.store.cfg["watchlist"])
+        if total == 0:
+            return 0
+        if not bool(self.cfg["display"].get("rotate_enabled", True)):
+            return 1
+        return max(1, min(int(self.cfg["display"]["visible_count"]), total, 3, self._count_limit))
+
+    def _pages(self) -> int:
+        count = self._visible_count()
+        if not count:
+            return 1
+        if not bool(self.cfg["display"].get("rotate_enabled", True)):
+            return 1
+        total = len(self.store.cfg["watchlist"])
+        return max(1, (total + count - 1) // count)
+
+    def _compute_visible(self) -> List[str]:
+        symbols = self.store.symbols()
+        count = self._visible_count()
+        if not count:
+            return []
+        pages = self._pages()
+        self.page %= pages
+        start = self.page * count
+        return symbols[start:start + count]
+
+    def _dock_anchor(self, w: int, h: int) -> tuple:
+        """默认落点：任务栏内、托盘左侧；不可贴靠时退回本屏工作区右下角。"""
+        band = self._band()
+        if self._dock_ok and band:
+            _left, right, tb = band
+            x = right - w
+            y = tb[1] + (tb[3] - tb[1] - h) // 2
+            return x, y
+        if self._mon:
+            left, top, right, bottom = self._mon["work"]
+        else:
+            left, top, right, bottom = work_area()
+        return right - w - self._p(18), bottom - h - self._p(6)
+
+    def _reposition(self, w: int, h: int) -> None:
+        """按当前偏移重新贴靠（换页/缩放导致尺寸变化时右边缘仍贴住托盘）。"""
+        ax, ay = self._dock_anchor(w, h)
+        self._anchor = (ax, ay)
+        self._x = ax + int(self.cfg["window"].get("offset_x") or 0)
+        self._y = ay + int(self.cfg["window"].get("offset_y") or 0)
+        self._clamp_position(w, h)
+
+    def _clamp_position(self, w: int, h: int) -> None:
+        band = self._band()
+        if self._dock_ok and band:
+            left, right, tb = band
+            if self._y + h > tb[1] + self._p(4) and self._y < tb[3] - self._p(4):
+                self._x = max(left, min(self._x, right - w))
+        vx, vy, vr, vb = virtual_screen()
+        self._x = max(vx - w + self._p(40), min(self._x, vr - self._p(40)))
+        self._y = max(vy, min(self._y, vb - self._p(20)))
+
+    def _clamp_virtual(self, w: int, h: int) -> None:
+        """拖动中只限制在整个虚拟桌面内，允许直接跨到副屏，不吸回主屏。"""
+        vx, vy, vr, vb = virtual_screen()
+        self._x = max(vx, min(self._x, vr - w))
+        self._y = max(vy, min(self._y, vb - h))
+
+    def _theme_luminance(self) -> Optional[float]:
+        """采样组件旁边的任务栏背景亮度（不能采组件自身，否则会读到文字）。"""
+        tb = (self._layout or {}).get("rect")
+        w, h = self._size
+        points = []
+        if tb:
+            for dy in (0.25, 0.5, 0.75):
+                for dx in (6, 14, 22, 30, 40):
+                    points.append((self._x - self._p(dx), int(self._y + h * dy)))
+            points.append((tb[0] + self._p(10), (tb[1] + tb[3]) // 2))
+            points.append((tb[0] + self._p(74), (tb[1] + tb[3]) // 2))
+        values = sorted(v for v in (screen_luminance(*p) for p in points) if v is not None)
+        return values[len(values) // 2] if values else None
+
+    def _pick_theme(self, point: Optional[tuple] = None) -> None:
+        mode = self.cfg["window"].get("text_theme", "auto")
+        if mode in ("dark", "light"):
+            dark = mode == "dark"
+        else:
+            lum = screen_luminance(*point) if point else self._theme_luminance()
+            dark = True if lum is None else lum < 0.5
+        if dark != self._dark:
+            self._last_sig = None
+        self._dark = dark
+        self._pal = palette(dark)
+
+    # ----------------------------------------------------------------- events
+    def post(self, event: str) -> None:
+        self.events.append(event)
+
+    def _drain_events(self) -> None:
+        while self.events:
+            event = self.events.popleft()
+            if event == "tray_left":
+                self.app.open_settings()
+            elif event == "tray_right":
+                self._show_menu(*cursor_pos())
+
+    def _on_press(self, event) -> None:
+        self._close_menu()
+        self._drag = (*cursor_pos(), self._x, self._y)
+        self._drag_moved = False
+
+    def _on_drag(self, event) -> None:
+        if not self._drag:
+            return
+        sx, sy, wx, wy = self._drag
+        dx, dy = cursor_pos()[0] - sx, cursor_pos()[1] - sy
+        if abs(dx) > self._p(4) or abs(dy) > self._p(4):
+            self._drag_moved = True
+        if self._drag_moved:
+            self._x, self._y = wx + dx, wy + dy
+            self._clamp_virtual(*self._size)
+            self.win.geometry(f"+{self._x}+{self._y}")
+            try:
+                self.hit.geometry(f"+{self._x}+{self._y}")
+            except Exception:
+                pass
+
+    def _on_release(self, event) -> None:
+        moved = self._drag_moved
+        self._drag = None
+        if moved:
+            self._adopt_drop_monitor()
+            self._save_position()
+        else:
+            self.app.open_settings()
+
+    def _adopt_drop_monitor(self) -> None:
+        """松手时按组件中心所在屏幕重新选任务栏，并按该屏 DPI 重排尺寸。"""
+        w, h = self._size
+        center = (self._x + w // 2, self._y + h // 2)
+        mon = monitor_from_point(*center)
+        if mon is None:
+            mon = self._mon
+        changed = not self._same_monitor(self._mon, mon)
+        self._apply_monitor(mon)
+        if changed:
+            self._replan()
+            w, h = self._preferred_size()
+            self._size = (w, h)
+            self._last_sig = None
+        self._clamp_position(w, h)
+        self._apply_geometry(w, h)
+        self._pick_theme()
+        # 拖动期间画面是冻结的，松手必须强制提交一帧（签名没变也要提交），
+        # 保证窗口位置、尺寸与位图在 ULW 里一次性对齐。
+        self._last_sig = None
+        self._render_now()
+        self._write_runtime()
+
+    def _on_right_click(self, event) -> None:
+        self._close_menu()
+        self._show_menu(event.x_root, event.y_root)
+
+    def _on_wheel(self, event) -> None:
+        # Ctrl 或 Shift + 滚轮 = 整体缩放；普通滚轮 = 翻页
+        if event.state & 0x0005:
+            self._zoom(SCALE_STEP if event.delta > 0 else -SCALE_STEP)
+            return
+        if not bool(self.cfg["display"].get("rotate_enabled", True)):
+            self._set_toast("轮播已关闭")
+            self._last_sig = None
+            self._render_now()
+            return
+        if self._pages() <= 1:
+            return
+        self.page = (self.page + (1 if event.delta < 0 else -1)) % self._pages()
+        self._next_rotate = time.time() + max(1, self.cfg["display"]["rotate_seconds"])
+        self._last_sig = None
+        self._render_now()
+
+    def _set_toast(self, text: str, seconds: float = 1.6) -> None:
+        self._toast = (text, time.time() + seconds)
+
+    def _toast_text(self) -> Optional[str]:
+        if not self._toast:
+            return None
+        text, until = self._toast
+        if time.time() >= until:
+            self._toast = None
+            return None
+        return text
+
+    def _zoom(self, delta: float) -> None:
+        """Ctrl/Shift+滚轮缩放：实时预览、立即落盘，触顶时提示限制。"""
+        old = self.scale
+        new = round(max(SCALE_MIN, min(SCALE_MAX, old + delta)), 2)
+        if new == old:
+            limit = "上限" if old >= SCALE_MAX else "下限"
+            self._set_toast(f"已达{limit} {int(old * 100)}%")
+            self._last_sig = None
+            self._render_now()
+            return
+        self.scale = new
+        self.cfg["window"]["scale"] = new
+        self.store.save()
+        self._set_toast(f"{int(new * 100)}%")
+        self._last_sig = None
+        self._replan()
+        w, h = self._preferred_size()
+        self._reposition(w, h)
+        self._size = (w, h)
+        self._apply_geometry(w, h)
+        self._pick_theme()
+        self._render_now()
+        self._write_runtime()
+        self._sync_settings_scale()
+
+    def _sync_settings_scale(self) -> None:
+        settings = getattr(self.app, "settings", None)
+        if settings is None:
+            return
+        try:
+            settings.scale_var.set(f"{int(round(self.scale * 100))}%")
+        except Exception:
+            pass
+
+    def _save_position(self) -> None:
+        """拖动结束后保存「显示器标识 + 相对该屏托盘默认落点的偏移」。"""
+        ax, ay = self._dock_anchor(*self._size)
+        self.cfg["window"]["offset_x"] = int(self._x - ax)
+        self.cfg["window"]["offset_y"] = int(self._y - ay)
+        mon = self._mon or {}
+        self.cfg["window"]["monitor"] = str(mon.get("device") or "")
+        self.cfg["window"]["monitor_rect"] = list(mon.get("rect") or [])
+        self.store.save()
+        self._write_runtime()
+
+    def reset_position(self) -> None:
+        self.cfg["window"]["offset_x"] = 0
+        self.cfg["window"]["offset_y"] = 0
+        self.cfg["window"]["monitor"] = ""
+        self.cfg["window"]["monitor_rect"] = []
+        self.store.save()
+        self._apply_monitor(self._primary_monitor(monitors()))
+        self._replan()
+        w, h = self._preferred_size()
+        ax, ay = self._dock_anchor(w, h)
+        self._anchor = (ax, ay)
+        self._x, self._y = ax, ay
+        self._size = (w, h)
+        self._apply_geometry(w, h)
+        self._write_runtime()
+        self._last_sig = None
+        self._pick_theme()
+        self._render_now()
+
+    # ------------------------------------------------------------------ menu
+    def _close_menu(self) -> None:
+        menu = getattr(self, "_menu", None)
+        self._menu = None
+        if menu is not None:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+            try:
+                menu.destroy()
+            except Exception:
+                pass
+
+    def _show_menu(self, x: int, y: int) -> None:
+        """自绘右键菜单（原生菜单在 NOACTIVATE 窗口里不会自动收起）。"""
+        self._close_menu()
+        bg, hover = "#20232b", "#343a47"
+        fg, dim, accent = "#f1f4fa", "#9aa1b0", "#79a6ff"
+
+        menu = tk.Toplevel(self.app.root)
+        self._menu = menu
+        menu.withdraw()
+        menu.overrideredirect(True)
+        menu.configure(bg=bg)
+        try:
+            menu.attributes("-topmost", True)
+        except Exception:
+            pass
+        outer = tk.Frame(menu, bg=bg, padx=px(4), pady=px(4),
+                         highlightthickness=1, highlightbackground="#3a4152")
+        outer.pack(fill="both", expand=True)
+
+        def add_row(label, command, color=None, bold=False):
+            holder = tk.Frame(outer, bg=bg, cursor="hand2")
+            holder.pack(fill="x", pady=px(1))
+            lab = tk.Label(holder, text=label, bg=bg, fg=color or fg,
+                           font=(FONT_FAMILY, px(11), "bold" if bold else "normal"),
+                           anchor="w", padx=px(10), pady=px(4))
+            lab.pack(fill="x")
+
+            def enter(_e):
+                holder.configure(bg=hover)
+                lab.configure(bg=hover)
+
+            def leave(_e):
+                holder.configure(bg=bg)
+                lab.configure(bg=bg)
+
+            def click(_e):
+                self._close_menu()
+                command()
+                return "break"
+
+            for widget in (holder, lab):
+                widget.bind("<Enter>", enter)
+                widget.bind("<Leave>", leave)
+                widget.bind("<Button-1>", click)
+
+        def add_sep():
+            tk.Frame(outer, bg="#3a4152", height=1).pack(fill="x", padx=px(8), pady=px(4))
+
+        def add_group(title, options, current, on_pick):
+            tk.Label(outer, text=title, bg=bg, fg=dim,
+                     font=(FONT_FAMILY, px(10)), anchor="w",
+                     padx=px(10), pady=px(2)).pack(fill="x")
+            line = tk.Frame(outer, bg=bg)
+            line.pack(fill="x", padx=px(10), pady=px(2))
+            for index, (value, lab_text) in enumerate(options):
+                active = value == current
+                chip = tk.Label(
+                    line, text=lab_text,
+                    bg="#2b3140" if active else bg,
+                    fg=accent if active else fg,
+                    font=(FONT_FAMILY, px(10)),
+                    padx=px(8), pady=px(3), cursor="hand2",
+                )
+                chip.pack(side="left", padx=(0 if index == 0 else px(4), 0))
+
+                def pick(_e, v=value):
+                    self._close_menu()
+                    on_pick(v)
+                    return "break"
+
+                chip.bind("<Button-1>", pick)
+
+        add_row("打开设置…", self.app.open_settings)
+        add_sep()
+        add_group(
+            "显示模式",
+            (("trend", "走势"), ("mini", "迷你")),
+            self.cfg["display"]["mode"],
+            lambda v: self.app.set_display(mode=v),
+        )
+        add_group(
+            "同时显示",
+            tuple((n, str(n)) for n in (1, 2, 3)),
+            int(self.cfg["display"]["visible_count"]),
+            lambda v: self.app.set_display(visible_count=v),
+        )
+        add_group(
+            "涨跌家数",
+            (("on", "显示"), ("off", "隐藏")),
+            "on" if self.cfg["display"].get("show_breadth", True) else "off",
+            lambda v: self.app.set_display(show_breadth=(v == "on")),
+        )
+        add_group(
+            "轮播",
+            (("on", "开启"), ("off", "关闭")),
+            "on" if bool(self.cfg["display"].get("rotate_enabled", True)) else "off",
+            lambda v: self.app.set_display(rotate_enabled=(v == "on")),
+        )
+        add_group(
+            "数据源",
+            (("auto", "自动"), ("tencent", "腾讯"), ("sina", "新浪")),
+            self.cfg["data"]["provider"],
+            lambda v: self.app.set_provider(v),
+        )
+        add_sep()
+        add_row("立即刷新", self.app.service.refresh_now)
+        add_row("打开配置文件", self.app.open_config_file)
+        add_sep()
+        add_row("退出小组件", self.app.quit_app, color="#ff8a9a")
+
+        menu.update_idletasks()
+        mw, mh = menu.winfo_reqwidth(), menu.winfo_reqheight()
+        vx, vy, vr, vb = virtual_screen()
+        mx = min(max(vx + px(8), x - mw // 2), max(vx + px(8), vr - mw - px(8)))
+        my = min(max(vy + px(8), y - mh - px(8)), max(vy + px(8), vb - mh - px(8)))
+        menu.geometry(f"{mw}x{mh}+{mx}+{my}")
+        menu.deiconify()
+        menu.update_idletasks()
+        apply_tool_window(menu)
+        raise_topmost(menu)
+        try:
+            menu.grab_set()
+        except Exception:
+            pass
+        try:
+            menu.focus_force()
+        except Exception:
+            pass
+        menu.bind("<FocusOut>", lambda _e: self._close_menu())
+        menu.bind("<Escape>", lambda _e: self._close_menu())
+        menu.bind("<Button-1>", lambda _e: self._close_menu())
+        menu.bind("<Destroy>", lambda _e: setattr(self, "_menu", None))
+
+    # ------------------------------------------------------------------ tick
+    def _tick(self) -> None:
+        try:
+            self._drain_events()
+            self._maybe_rotate()
+            self._ensure_geometry()
+            self._render_now()
+        except Exception:
+            from .util import log
+            log("小组件刷新异常", exc=True)
+        finally:
+            self._tick_id = self.win.after(400, self._tick)
+
+    @staticmethod
+    def _layout_key(layout) -> tuple:
+        if not layout:
+            return ()
+        return (layout.get("rect"), layout.get("tray"), layout.get("occupied_right"),
+                layout.get("orientation"), layout.get("autohide"),
+                layout.get("monitor_device"), layout.get("monitor_rect"),
+                round(float(layout.get("dpi") or 0), 2))
+
+    def _ensure_geometry(self) -> None:
+        # 拖动中完全冻结：不抢 z-order、不查布局、不重绘，避免与 Tk 的移动竞争。
+        if self._drag:
+            return
+        # Win11 在跨屏/DPI 变化时，DWM/Tk 可能擅自改窗口尺寸，此时旧位图会被
+        # 拉伸成“花字/字形错位”。每次 tick 校验真实矩形，不一致就按当前尺寸重画。
+        actual = window_rect(hwnd_of_toplevel(self.win))
+        if actual:
+            size = (actual[2] - actual[0], actual[3] - actual[1])
+            if size != self._size:
+                self._apply_geometry(*self._size)
+                self._last_sig = None
+        now = time.time()
+        if now - self._last_geo_check < 2.0:
+            return
+        self._last_geo_check = now
+        if self.cfg["window"]["always_on_top"]:
+            # 每 tick 抢 z-order 会和拖动/合成打架，2 秒一次足够压住任务栏。
+            raise_topmost(self.win)
+            raise_topmost(self.hit)
+            if self._menu is not None:
+                raise_topmost(self._menu)
+        mon_changed = self._follow_monitor()
+        fresh = taskbar_layout(point=self._monitor_center())
+        if mon_changed or self._layout_key(fresh) != self._layout_key(self._layout):
+            self._replan()
+            w, h = self._preferred_size()
+            ax, ay = self._dock_anchor(w, h)
+            self._anchor = (ax, ay)
+            self._x = ax + int(self.cfg["window"].get("offset_x") or 0)
+            self._y = ay + int(self.cfg["window"].get("offset_y") or 0)
+            self._clamp_position(w, h)
+            self._size = (w, h)
+            self._apply_geometry(w, h)
+            self._last_sig = None
+            self._pick_theme()
+
+        if now - self._last_theme_check > 8.0:
+            self._last_theme_check = now
+            self._pick_theme()
+
+    def _maybe_rotate(self) -> None:
+        if not bool(self.cfg["display"].get("rotate_enabled", True)):
+            return
+        seconds = int(self.cfg["display"]["rotate_seconds"])
+        if seconds <= 0 or self._pages() <= 1:
+            return
+        now = time.time()
+        if now >= self._next_rotate:
+            self.page = (self.page + 1) % self._pages()
+            self._next_rotate = now + seconds
+
+    def _render_now(self) -> None:
+        # 拖动中冻结位图：Tk 只负责移动窗口，不再提交画面，松手后统一提交一次。
+        if self._drag is not None:
+            return
+        quotes, sparks, meta = self.app.service.snapshot()
+        visible = self._compute_visible()
+        self._visible = visible
+        mode = self.cfg["display"]["mode"]
+        breadth = meta.get("breadth") if self._show_breadth else None
+        toast = self._toast_text()
+        signature = (
+            meta.get("version"),
+            tuple(visible),
+            self.page,
+            mode,
+            self.cfg["display"]["color_style"],
+            self._size,
+            self.scale,
+            self._dark,
+            self._show_breadth,
+            self._breadth_w,
+            toast,
+        )
+        if breadth:
+            signature += (breadth.get("up"), breadth.get("down"),
+                          breadth.get("flat"), breadth.get("stale"))
+        for symbol in visible:
+            quote = quotes.get(symbol)
+            spark = sparks.get(symbol)
+            points = spark.points if spark and spark.points else ()
+            signature += (
+                symbol,
+                self._name_for(symbol, quote, meta),
+                round(quote.price, 3) if quote else None,
+                round(quote.change_pct, 3) if quote else None,
+                quote.stale if quote else True,
+                len(points),
+                round(points[-1], 3) if points else None,
+            )
+        if signature == self._last_sig:
+            return
+        self._last_sig = signature
+
+        w, h = self._preferred_size()
+        if (w, h) != self._size:
+            self._size = (w, h)
+            self._reposition(w, h)
+            # 尺寸变了必须先让窗口真正调整到位，再 UpdateLayeredWindow；
+            # 否则新尺寸的位图会提交到旧尺寸窗口，界面会变成一块黑板。
+            self._apply_geometry(w, h)
+            self._write_runtime()
+        if w <= 0 or h <= 0:
+            return
+
+        cw, ch = self._card_size()
+        gap = self.s(GAP, 2)
+        frame = Frame(w, h)
+        if not visible and not self._show_breadth:
+            frame.text(w / 2, h / 2, "右键 → 设置，添加自选股", self._fs(10.5),
+                       self._pal["muted"], anchor="center")
+        else:
+            for index, symbol in enumerate(visible):
+                self._draw_card(frame, index * (cw + gap), 0, cw, ch, symbol,
+                                quotes.get(symbol), sparks.get(symbol), meta, mode)
+            if self._show_breadth and self._breadth_w > 0:
+                x0 = len(visible) * (cw + gap) if visible else 0
+                self._draw_breadth(frame, x0, 0, self._breadth_w, ch, breadth)
+        if toast:
+            frame.text(w - self.s(5), ch * 0.26, toast, self._fs(9.5),
+                       self._pal["amber"], bold=True, anchor="e")
+
+        if self.surface:
+            self.surface.update(frame.image(), self._x, self._y)
+
+    def _name_for(self, symbol: str, quote, meta) -> str:
+        """用户别名优先，其次行情接口中文名，最后本地缓存/代码。"""
+        alias = self.store.alias_of(symbol)
+        if alias:
+            return alias
+        name = (quote.name or "").strip() if quote else ""
+        if name:
+            return name
+        return (meta.get("names") or {}).get(symbol) or symbol
+
+    def _fit(self, text: str, max_w: float, size: float, bold: bool = False) -> str:
+        """按真实字体宽度截断，避免长名称撑破卡片。"""
+        text = text or ""
+        max_w = max(self.s(16), float(max_w))
+        if not text or text_width(text, size, bold) <= max_w:
+            return text
+        for length in range(len(text) - 1, 0, -1):
+            candidate = text[:length] + "…"
+            if text_width(candidate, size, bold) <= max_w:
+                return candidate
+        return "…"
+
+    # ------------------------------------------------------------------ draw
+    def _dir_color(self, pct: float) -> str:
+        p = self._pal
+        up = p["red"] if self.cfg["display"]["color_style"] == "cn" else p["green"]
+        down = p["green"] if self.cfg["display"]["color_style"] == "cn" else p["red"]
+        if pct > 0:
+            return up
+        if pct < 0:
+            return down
+        return p["muted"]
+
+    def _draw_card(self, frame: Frame, x0: float, y0: float, cw: int, ch: int,
+                   symbol: str, quote, spark, meta, mode: str) -> None:
+        name = self._name_for(symbol, quote, meta)
+        stale = bool(quote.stale) if quote else True
+        pending = quote is None and not meta.get("error")
+        error = quote is None and bool(meta.get("error"))
+        p = self._pal
+
+        if stale and not pending:
+            frame.dot(x0 + cw - self.s(7), y0 + ch * 0.28,
+                      max(1.6, self.s(1.8)), p["amber"])
+
+        if mode == "mini":
+            self._draw_mini(frame, x0, y0, cw, ch, name, quote, pending, error)
+        else:
+            self._draw_trend(frame, x0, y0, cw, ch, name, quote, spark, pending, error)
+
+    def _price_text(self, quote) -> str:
+        if not quote:
+            return "—"
+        if quote.price >= 10000:
+            return f"{quote.price:,.0f}"
+        return f"{quote.price:.2f}"
+
+    def _pct_text(self, quote) -> str:
+        if not quote:
+            return ""
+        return f"{quote.change_pct:+.2f}%"
+
+    def _draw_trend(self, frame: Frame, x0, y0, cw, ch, name, quote, spark,
+                    pending, error) -> None:
+        p = self._pal
+        color = self._dir_color(quote.change_pct) if quote else p["muted"]
+        pad = self.s(10)
+        left = x0 + pad
+        name_size = self._fs(NAME_FS)
+        price_size = self._fs(PRICE_FS)
+        pct_size = self._fs(PCT_FS)
+        name_y = y0 + ch * 0.26
+        # 现价与涨跌幅共用一个基线，字号不同也不会上下错位
+        base_y = self._baseline(y0, ch)
+
+        name = self._fit(name, cw - self.s(46), name_size)
+        frame.text(left, name_y, name, name_size,
+                   p["name"] if quote else p["dim"])
+
+        price = "—" if pending or error else self._price_text(quote)
+        frame.text(left, base_y, price, price_size, color, bold=True, anchor="ls")
+
+        text = self._pct_text(quote)
+        pct_w = 0.0
+        if text:
+            price_w = text_width(price, price_size, True)
+            pct_x = left + price_w + self.s(6)
+            pct_w = text_width(text, pct_size)
+            frame.text(pct_x, base_y, text, pct_size, color, anchor="ls")
+
+        spark_right = x0 + cw - pad
+        spark_left = max(left + text_width(price, price_size, True) + pct_w + self.s(10),
+                         x0 + cw * 0.50)
+        if spark_right - spark_left >= self.s(22):
+            if spark and len(spark.points) >= 2:
+                prev = spark.prev_close or (quote.prev_close if quote else 0)
+                draw_spark(frame, (spark_left, y0 + ch * 0.25, spark_right, y0 + ch * 0.76),
+                           spark.points, prev, color, p["guide"],
+                           width=max(1.0, 1.3 * self.scale))
+            else:
+                mid = y0 + ch * 0.50
+                frame.dashed(spark_left, mid, spark_right, mid, p["guide"],
+                             width=max(1.0, self.scale))
+
+        if pending:
+            frame.text(x0 + cw - pad, y0 + ch * 0.26, "读取中",
+                       self._fs(9), p["dim"], anchor="e")
+        elif error:
+            frame.text(x0 + cw - pad, y0 + ch * 0.26, "离线",
+                       self._fs(9), p["amber"], anchor="e")
+
+    def _baseline(self, y0: float, ch: float) -> float:
+        """第二行文字（现价/涨跌幅/家数）的共用基线，底部留 3px 呼吸。"""
+        return y0 + ch - max(3, self.s(3))
+
+    def _draw_mini(self, frame: Frame, x0, y0, cw, ch, name, quote,
+                   pending, error) -> None:
+        """迷你模式：只画「名称 + 涨跌幅」，不画走势线，也不带涨跌家数。"""
+        p = self._pal
+        pad = self.s(8)
+        left = x0 + pad
+        name_size = self._fs(NAME_FS)
+        pct_size = self._fs(MINI_PCT_FS)
+        base_y = self._baseline(y0, ch)
+        name = self._fit(name, cw - pad * 2, name_size)
+        frame.text(left, y0 + ch * 0.26, name, name_size,
+                   p["name"] if quote else p["dim"])
+
+        if pending:
+            frame.text(left, base_y, "读取中", self._fs(10), p["dim"], anchor="ls")
+            return
+        if error or not quote:
+            frame.text(left, base_y, "离线", self._fs(10), p["amber"], anchor="ls")
+            return
+
+        color = self._dir_color(quote.change_pct)
+        if quote.change_pct != 0:
+            # 三角与涨跌幅数字的光学中心对齐（数字高约 0.7em）
+            draw_arrow(frame, left + self.s(5), base_y - pct_size * 0.34,
+                       quote.change_pct > 0, color, max(2.5, 4.4 * self.scale))
+        text_x = left + (self.s(14) if quote.change_pct != 0 else 0)
+        frame.text(text_x, base_y, self._pct_text(quote), pct_size,
+                   color, bold=True, anchor="ls")
+
+    def _draw_breadth(self, frame: Frame, x0, y0, cw, ch, breadth) -> None:
+        """上涨/下跌/平盘家数三列；无数据时显示“—”，失败保留旧值加琥珀点。"""
+        p = self._pal
+        label_size = self._fs(BREADTH_LABEL_FS)
+        num_size = self._fs(BREADTH_NUM_FS)
+        up_color = p["red"] if self.cfg["display"]["color_style"] == "cn" else p["green"]
+        down_color = p["green"] if self.cfg["display"]["color_style"] == "cn" else p["red"]
+        columns = (
+            ("涨", up_color, breadth.get("up") if breadth else None),
+            ("跌", down_color, breadth.get("down") if breadth else None),
+            ("平", p["muted"], breadth.get("flat") if breadth else None),
+        )
+        col_w = cw / 3.0
+        base_y = self._baseline(y0, ch)
+        for index, (label, color, value) in enumerate(columns):
+            cx = x0 + col_w * (index + 0.5)
+            frame.text(cx, y0 + ch * 0.28, label, max(7.5, label_size),
+                       color if value is not None else p["dim"], anchor="center")
+            number = "—" if value is None else f"{value}"
+            # 三列数字与现价同基线，跨卡片看起来齐平
+            frame.text(cx, base_y, number, num_size,
+                       color if value is not None else p["dim"],
+                       bold=True, anchor="ms")
+        if breadth and breadth.get("stale"):
+            frame.dot(x0 + cw - self.s(5), y0 + ch * 0.22,
+                      max(1.6, self.s(1.8)), p["amber"])
+
+    # ---------------------------------------------------------------- runtime
+    def _write_runtime(self) -> None:
+        try:
+            w, h = self._size
+            _quotes, _sparks, meta = self.app.service.snapshot()
+            payload = {
+                "x": int(self._x),
+                "y": int(self._y),
+                "w": int(w),
+                "h": int(h),
+                "mode": self.cfg["display"]["mode"],
+                "scale": round(self.scale, 2),
+                "symbols": self._visible or [],
+                "docked": bool(self._dock_ok),
+                "dark": bool(self._dark),
+                "offset_x": int(self.cfg["window"].get("offset_x") or 0),
+                "offset_y": int(self.cfg["window"].get("offset_y") or 0),
+                "monitor": (self._mon or {}).get("device") or "",
+                "monitor_rect": (self._mon or {}).get("rect"),
+                "dpi": round(self._dpi_mul, 2),
+                "rotate_enabled": bool(self.cfg["display"].get("rotate_enabled", True)),
+                "taskbar": (self._layout or {}).get("rect"),
+                "tray": (self._layout or {}).get("tray"),
+                "capacity": self._visible_count(),
+                "show_breadth": bool(self._show_breadth),
+                "names": meta.get("names") or {},
+                "breadth": meta.get("breadth"),
+                "pid": __import__("os").getpid(),
+            }
+            RUNTIME_PATH.write_text(json.dumps(payload, ensure_ascii=False),
+                                    encoding="utf-8")
+        except Exception:
+            pass

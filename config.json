@@ -1,0 +1,33 @@
+{
+  "watchlist": [
+    { "symbol": "sh600519", "alias": "贵州茅台" },
+    { "symbol": "sz000001", "alias": "平安银行" },
+    { "symbol": "sh000001", "alias": "上证指数" }
+  ],
+  "display": {
+    "mode": "trend",
+    "visible_count": 1,
+    "show_breadth": true,
+    "rotate_enabled": true,
+    "rotate_seconds": 10,
+    "color_style": "cn"
+  },
+  "data": {
+    "provider": "auto",
+    "interval_seconds": 3,
+    "timeout_seconds": 6,
+    "stale_after_seconds": 30,
+    "intraday_refresh_seconds": 60
+  },
+  "window": {
+    "offset_x": 0,
+    "offset_y": 0,
+    "monitor": "",
+    "monitor_rect": [],
+    "max_width": 0,
+    "text_theme": "auto",
+    "always_on_top": true,
+    "scale": 0.8,
+    "scale_version": 2
+  }
+}
