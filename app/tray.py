@@ -36,6 +36,10 @@ user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, WPARAM, LPARAM]
 user32.DefWindowProcW.restype = LRESULT
 shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.c_void_p]
 shell32.Shell_NotifyIconW.restype = wt.BOOL
+# 64 位下模块句柄/窗口句柄必须按指针宽度返回，否则会被截断成 32 位
+kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+user32.CreateWindowExW.restype = wt.HWND
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -111,7 +115,8 @@ class TrayIcon:
                 pass
 
             self.hwnd = user32.CreateWindowExW(
-                0, "TaskbarStockTrayWnd", "", 0, 0, 0, 0, 0, None, None, hinst, None
+                0, "TaskbarStockTrayWnd", "", 0, 0, 0, 0, 0, None, None,
+                ctypes.c_void_p(hinst), None
             )
             if not self.hwnd:
                 self._ready.set()

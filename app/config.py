@@ -67,6 +67,9 @@ DEFAULTS: Dict[str, Any] = {
         "rotate_enabled": True,       # 是否启用轮播；关闭时固定显示自选第一只
         "rotate_seconds": 10,          # 轮播间隔，0 = 不轮播
         "color_style": "cn",           # cn=红涨绿跌（A股习惯），intl=绿涨红跌
+        "hidden_mode": False,          # 隐藏模式：平时不可见，鼠标进贴靠热区才显示
+        "hidden_delay": 1.5,           # 移出热区后自动隐藏的延时（秒）
+        "hotspot_width": 160,          # 隐藏模式热区最小宽度（物理像素）
     },
     "data": {
         "provider": "auto",            # auto | tencent | sina
@@ -230,10 +233,32 @@ class ConfigStore:
                 entry = {"symbol": entry}
             if not isinstance(entry, dict):
                 continue
+            alias = str(entry.get("alias") or "").strip()
+            kind = "gold" if str(entry.get("kind") or "").lower() == "gold" else "stock"
+            if kind == "gold":
+                sym = str(entry.get("symbol") or "").strip()
+                if not sym.startswith("gold:"):
+                    continue
+                changed = entry.get("manual_updated")
+                try:
+                    changed = float(changed or 0)
+                except (TypeError, ValueError):
+                    changed = 0.0
+                items.append({
+                    "symbol": sym,
+                    "alias": alias,
+                    "kind": "gold",
+                    "manual_price": round(
+                        _clamp_float(entry.get("manual_price"), 0, 100000, 0), 3),
+                    "manual_prev": round(
+                        _clamp_float(entry.get("manual_prev"), 0, 100000, 0), 3),
+                    "manual_updated": changed,
+                })
+                continue
             sym = normalize_symbol(entry.get("symbol", ""))
             if not sym:
                 continue
-            items.append({"symbol": sym, "alias": str(entry.get("alias") or "").strip()})
+            items.append({"symbol": sym, "alias": alias})
         cfg["watchlist"] = items
 
         display = cfg.setdefault("display", {})
@@ -245,6 +270,11 @@ class ConfigStore:
         display["rotate_seconds"] = _clamp(display.get("rotate_seconds"), 0, 600, 10)
         if display.get("color_style") not in ("cn", "intl"):
             display["color_style"] = "cn"
+        display["hidden_mode"] = bool(display.get("hidden_mode", False))
+        display["hidden_delay"] = round(
+            _clamp_float(display.get("hidden_delay"), 0.5, 5.0, 1.5), 2)
+        display["hotspot_width"] = _clamp(
+            display.get("hotspot_width"), 60, 600, 160)
 
         data = cfg.setdefault("data", {})
         if data.get("provider") not in _PROVIDERS:
@@ -302,6 +332,15 @@ class ConfigStore:
             if item["symbol"] == symbol:
                 return item.get("alias") or ""
         return ""
+
+    def item_of(self, symbol: str) -> dict:
+        for item in self.cfg["watchlist"]:
+            if item["symbol"] == symbol:
+                return item
+        return {}
+
+    def kind_of(self, symbol: str) -> str:
+        return str(self.item_of(symbol).get("kind") or "stock")
 
 
 def _clamp(value: Any, low, high, default):

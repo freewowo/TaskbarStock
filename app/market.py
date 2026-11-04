@@ -15,7 +15,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Dict, List, Optional
 
 try:
@@ -24,6 +26,8 @@ except ImportError:  # pragma: no cover - 纯标准库兜底
     requests = None
 
 from .config import CONFIG_DIR, clean_code, normalize_symbol
+from .trading import gold_interval as current_gold_interval
+from .trading import poll_interval
 from .util import log
 
 UA = (
@@ -358,6 +362,151 @@ RESOLVED_PATH = CONFIG_DIR / "resolved.json"
 SEARCH_URL = "https://searchapi.eastmoney.com/api/suggest/get"
 SEARCH_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
 
+# ---------------------------------------------------------------- gold / 积存金
+GOLD_SGE_SYMBOL = "gold:AU9999"        # 上海黄金交易所 Au99.99（参考金价）
+GOLD_MANUAL_PREFIX = "gold:manual:"
+SGE_SECIDS = {GOLD_SGE_SYMBOL: "118.AU9999"}
+GOLD_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+SINA_GOLD_URL = "https://hq.sinajs.cn/list=SGE_AU9999"
+GOLD_NOTE = "参考金价（上金所 Au99.99），非银行积存金报价"
+
+
+class GoldProvider:
+    """上海黄金交易所 Au99.99 参考价（单位 元/克）。
+
+    主源：新浪财经 SGE_AU9999（返回现价、昨收、高低、更新时间）；
+    备源：东方财富 118.AU9999。银行积存金（工行/建行/招行/农行）没有
+    稳定的公开报价接口，界面统一标注“参考”，不冒充银行报价。
+    贵金属站点不走系统代理，避免代理抽风时行情完全不可用。
+    """
+
+    def __init__(self, timeout: float = 6.0) -> None:
+        self.timeout = timeout
+        self.session = _new_session()
+        try:
+            self.session.trust_env = False
+        except Exception:
+            pass
+        self.session.headers.update({
+            "User-Agent": UA,
+            "Referer": "https://finance.sina.com.cn/",
+        })
+
+    def fetch(self, symbols: List[str]) -> Dict[str, Quote]:
+        wanted = [s for s in symbols if s in SGE_SECIDS]
+        if not wanted:
+            return {}
+        try:
+            return self._fetch_sina(wanted)
+        except Exception as sina_exc:
+            try:
+                return self._fetch_eastmoney(wanted)
+            except Exception as em_exc:
+                raise ProviderError(f"新浪: {sina_exc}; 东财: {em_exc}")
+
+    def _fetch_sina(self, symbols: List[str]) -> Dict[str, Quote]:
+        resp = self.session.get(SINA_GOLD_URL, timeout=self.timeout)
+        resp.raise_for_status()
+        text = resp.content.decode("gbk", errors="ignore")
+        out: Dict[str, Quote] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("var hq_str_SGE_AU9999="):
+                continue
+            payload = line.partition("=")[2].strip().strip(";").strip('"')
+            fields = payload.split(",")
+            if len(fields) < 18:
+                continue
+            price = _num(fields[3])
+            prev = _num(fields[5])
+            if price <= 0 or prev <= 0:
+                continue
+            change = price - prev
+            pct = _num(fields[17].replace("%", ""), change / prev * 100)
+            stamp = fields[16].strip()
+            quote_time = stamp.split(" ")[-1] if stamp else ""
+            out[GOLD_SGE_SYMBOL] = Quote(
+                symbol=GOLD_SGE_SYMBOL,
+                name="黄金9999",
+                price=price,
+                prev_close=prev,
+                open=_num(fields[9]),
+                high=_num(fields[7]),
+                low=_num(fields[8]),
+                change=change,
+                change_pct=pct,
+                quote_time=quote_time,
+                updated_at=time.time(),
+                source="sge-sina",
+            )
+        if not out:
+            raise ProviderError("新浪 SGE_AU9999 返回空数据")
+        return out
+
+    def _fetch_eastmoney(self, symbols: List[str]) -> Dict[str, Quote]:
+        out: Dict[str, Quote] = {}
+        for symbol in symbols:
+            secid = SGE_SECIDS.get(symbol)
+            if not secid:
+                continue
+            data = self._one(secid)
+            if not data:
+                continue
+            price = _num(data.get("f43"))
+            prev = _num(data.get("f60"))
+            if price <= 0:
+                continue
+            pct = _num(data.get("f170"))
+            stamp = data.get("f86")
+            quote_time = ""
+            try:
+                if stamp:
+                    quote_time = datetime.fromtimestamp(int(stamp)).strftime("%H:%M:%S")
+            except (TypeError, ValueError, OSError):
+                quote_time = ""
+            out[symbol] = Quote(
+                symbol=symbol,
+                name=str(data.get("f58") or "黄金9999"),
+                price=price,
+                prev_close=prev,
+                change=_num(data.get("f169"), price - prev),
+                change_pct=pct if pct else ((price - prev) / prev * 100 if prev else 0),
+                quote_time=quote_time,
+                updated_at=time.time(),
+                source="sge-em",
+            )
+        if not out:
+            raise ProviderError("上金所 Au99.99 报价为空")
+        return out
+
+    def _one(self, secid: str) -> Optional[dict]:
+        last: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                resp = self.session.get(
+                    GOLD_QUOTE_URL,
+                    params={
+                        "secid": secid,
+                        "fltt": "2",
+                        "invt": "2",
+                        "fields": "f43,f57,f58,f60,f86,f169,f170",
+                    },
+                    timeout=self.timeout,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                data = (payload or {}).get("data")
+                if isinstance(data, dict) and _num(data.get("f43")) > 0:
+                    return data
+                raise ProviderError("Au99.99 返回空数据")
+            except Exception as exc:
+                last = exc
+                if attempt == 0:
+                    time.sleep(0.5)
+        if last:
+            raise ProviderError(str(last))
+        return None
+
 _resolved: Optional[Dict[str, str]] = None
 
 
@@ -667,6 +816,16 @@ class MarketService:
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._symbols: List[str] = []
+        self._stock_symbols: List[str] = []
+        self._gold_items: List[dict] = []
+        self._gold_hist: Dict[str, deque] = {}
+        self._gold_at = 0.0
+        self._gold_every = 30
+        self._gold_failed = False
+        self._stock_at = 0.0
+        self._force = threading.Event()
+        self._poll_log: deque = deque(maxlen=60)
+        self._adaptive: dict = {}
         self._quotes: Dict[str, Quote] = {}
         self._sparks: Dict[str, Spark] = {}
         self._spark_at: Dict[str, float] = {}
@@ -689,6 +848,7 @@ class MarketService:
             "names": {},
             "breadth": None,
             "breadth_error": "",
+            "gold_error": "",
         }
         self._timeout = 6.0
         self._interval = 3.0
@@ -703,13 +863,25 @@ class MarketService:
     # ------------------------------------------------------------- config
     def apply(self, cfg: dict) -> None:
         with self._lock:
-            self._symbols = [item["symbol"] for item in cfg["watchlist"]]
+            watch = list(cfg["watchlist"])
+            self._stock_symbols = [
+                item["symbol"] for item in watch
+                if str(item.get("kind") or "stock") == "stock"
+            ]
+            self._gold_items = [
+                dict(item) for item in watch
+                if str(item.get("kind") or "stock") == "gold"
+            ]
+            self._symbols = list(self._stock_symbols)
+            self._gold_at = 0.0
             data = cfg["data"]
             self._timeout = float(data["timeout_seconds"])
             self._interval = float(data["interval_seconds"])
             self._stale_after = float(data["stale_after_seconds"])
             self._intraday_every = float(data["intraday_refresh_seconds"])
             self._provider = data.get("provider", "auto")
+        # 配置变化（切换标的/保存设置）后强制请求一次，避免沿用旧缓存
+        self._force.set()
         self._wake.set()
 
     def start(self) -> None:
@@ -722,17 +894,61 @@ class MarketService:
             self._thread.join(timeout=2)
 
     def refresh_now(self) -> None:
+        """用户手动刷新/切换标的/重新显示时强制请求一次（无视自适应间隔）。"""
+        self._force.set()
         self._wake.set()
+
+    def adaptive_plan(self) -> dict:
+        with self._lock:
+            return dict(self._adaptive)
 
     # ------------------------------------------------------------ snapshot
     def snapshot(self):
         with self._lock:
             quotes = {k: replace(v) for k, v in self._quotes.items()}
             sparks = dict(self._sparks)
+            for symbol, points in self._gold_hist.items():
+                if len(points) < 2:
+                    continue
+                quote = self._quotes.get(symbol)
+                sparks[symbol] = Spark(
+                    symbol, list(points), [], quote.prev_close if quote else 0.0,
+                    "gold-history")
             meta = dict(self._meta)
             meta["names"] = dict(self._names)
             meta["breadth"] = dict(self._breadth) if self._breadth else None
+            meta["adaptive"] = dict(self._adaptive)
+            meta["poll_log"] = list(self._poll_log)
         return quotes, sparks, meta
+
+    @staticmethod
+    def _manual_quote(item: dict) -> Optional[Quote]:
+        """手动维护的固定价格：涨跌幅按“上次更新/昨收”口径计算。"""
+        symbol = str(item.get("symbol") or "")
+        price = float(item.get("manual_price") or 0)
+        if price <= 0:
+            return None
+        prev = float(item.get("manual_prev") or 0)
+        change = price - prev if prev > 0 else 0.0
+        pct = (change / prev * 100) if prev > 0 else 0.0
+        stamp = float(item.get("manual_updated") or 0)
+        try:
+            quote_time = (datetime.fromtimestamp(stamp).strftime("%m-%d %H:%M")
+                          if stamp > 0 else "手动")
+        except (ValueError, OSError):
+            quote_time = "手动"
+        return Quote(
+            symbol=symbol,
+            name=str(item.get("alias") or "自定义金价"),
+            price=price,
+            prev_close=prev,
+            change=change,
+            change_pct=pct,
+            quote_time=quote_time,
+            updated_at=stamp or time.time(),
+            stale=False,
+            source="manual",
+        )
 
     # --------------------------------------------------------------- names
     @staticmethod
@@ -855,25 +1071,62 @@ class MarketService:
         return None
 
     # ---------------------------------------------------------------- loop
+    def _plan(self) -> dict:
+        with self._lock:
+            has_stock = bool(self._stock_symbols)
+            has_gold = any(not str(item.get("symbol") or "").startswith(GOLD_MANUAL_PREFIX)
+                           for item in self._gold_items)
+            base = self._interval
+        return poll_interval(base, has_stock, has_gold)
+
     def _run(self) -> None:
         log("行情轮询线程启动")
+        last_phase = None
         while not self._stop.is_set():
+            plan = self._plan()
+            with self._lock:
+                self._adaptive = plan
+                self._poll_log.append({
+                    "time": time.strftime("%H:%M:%S"),
+                    "phase": plan["phase"],
+                    "interval": plan["interval"],
+                })
+            if plan["phase"] != last_phase:
+                log(f"自适应刷新: {plan['phase']} 间隔 {plan['interval']:.0f}s，"
+                    f"下次约 {plan['next_at']}")
+                last_phase = plan["phase"]
             try:
                 self._poll()
             except Exception:
                 log("轮询循环异常", exc=True)
-            self._wake.wait(self._interval)
+            # 请求可能耗时，唤醒时刻按请求结束的当前时间重新计算，
+            # 保证 09:30 / 13:00 的切换不会被粗粒度 sleep 拖后。
+            plan = self._plan()
+            if self._stop.is_set():
+                break
+            self._wake.wait(plan["sleep"])
             self._wake.clear()
         log("行情轮询线程退出")
 
     def _poll(self) -> None:
         with self._lock:
             symbols = list(self._symbols)
+            gold_items = [dict(item) for item in self._gold_items]
         now = time.time()
+        force = self._force.is_set()
+        if force:
+            self._force.clear()
+        phase = self._plan()["phase"]
+        # 涨跌家数与股票同属 A 股时段：收盘后 30 分钟、非交易日 60 分钟一次。
+        self._breadth_every = {
+            "trading": 15.0, "preopen": 300.0, "lunch": 300.0,
+            "closed": 1800.0,
+        }.get(phase, 3600.0)
+        self._gold_every = current_gold_interval()
 
         # 涨跌家数不需要 3 秒一刷，降低频率可避免东财风控直接断开连接
         breadth = None
-        if now - self._breadth_at >= self._breadth_every:
+        if force or now - self._breadth_at >= self._breadth_every:
             self._breadth_at = now
             breadth = self._fetch_breadth()
         with self._lock:
@@ -889,7 +1142,7 @@ class MarketService:
             else:
                 self._meta["breadth_error"] = self._breadth_error
 
-        if not symbols:
+        if not symbols and not gold_items:
             with self._lock:
                 self._meta["error"] = "未配置自选股"
                 self._meta["version"] += 1
@@ -897,25 +1150,58 @@ class MarketService:
             self._save_names()
             return
 
-        providers: List[object] = []
-        if self._provider in PROVIDERS:
-            providers = [PROVIDERS[self._provider](self._timeout)]
-        else:
-            providers = [TencentProvider(self._timeout), SinaProvider(self._timeout)]
+        # 轮询循环按“股票/积存金/涨跌家数”里最短的间隔醒来；每类标的再按
+        # 自己的时段判断本轮是否真的发请求，收盘后股票不会跟着黄金每 15 秒刷。
+        stock_plan = poll_interval(self._interval, True, False)
+        want_stock = bool(symbols) and (
+            force or now - self._stock_at >= stock_plan["interval"])
+        if want_stock:
+            self._stock_at = now
 
         quotes: Optional[Dict[str, Quote]] = None
         error = ""
         used = None
-        for provider in providers:
-            try:
-                quotes = provider.fetch_quotes(symbols)
-                used = provider
-                break
-            except Exception as exc:
-                error = f"{provider.label if hasattr(provider, 'label') else provider.name}: {exc}"
+        if symbols and want_stock:
+            providers: List[object] = []
+            if self._provider in PROVIDERS:
+                providers = [PROVIDERS[self._provider](self._timeout)]
+            else:
+                providers = [TencentProvider(self._timeout), SinaProvider(self._timeout)]
+            for provider in providers:
+                try:
+                    quotes = provider.fetch_quotes(symbols)
+                    used = provider
+                    break
+                except Exception as exc:
+                    error = (f"{provider.label if hasattr(provider, 'label') else provider.name}"
+                             f": {exc}")
+            if quotes:
+                self._fill_names(quotes, symbols, providers, used)
 
-        if quotes:
-            self._fill_names(quotes, symbols, providers, used)
+        # ---------------------------------------------------------- gold
+        gold_quotes: Dict[str, Quote] = {}
+        gold_error = ""
+        remote_gold = [item["symbol"] for item in gold_items
+                       if not str(item["symbol"]).startswith(GOLD_MANUAL_PREFIX)]
+        attempted_gold = False
+        if remote_gold and (force or now - self._gold_at >= self._gold_every):
+            attempted_gold = True
+            self._gold_at = now
+            try:
+                gold_quotes = GoldProvider(self._timeout).fetch(remote_gold)
+                self._gold_failed = False
+            except Exception as exc:
+                self._gold_failed = True
+                gold_error = f"上金所 Au99.99: {exc}"
+
+        manual_quotes: Dict[str, Quote] = {}
+        for item in gold_items:
+            symbol = str(item["symbol"])
+            if not symbol.startswith(GOLD_MANUAL_PREFIX):
+                continue
+            quote = self._manual_quote(item)
+            if quote:
+                manual_quotes[symbol] = quote
 
         now = time.time()
         with self._lock:
@@ -929,14 +1215,48 @@ class MarketService:
                 self._meta["last_ok"] = now
                 self._meta["error"] = ""
                 self._meta["provider"] = used.name if used else ""
-            else:
+            elif symbols and want_stock:
                 self._meta["error"] = error or "行情获取失败"
-            for symbol in symbols:
+
+            if remote_gold and gold_quotes:
+                for symbol, quote in gold_quotes.items():
+                    prev = self._quotes.get(symbol)
+                    self._quotes[symbol] = quote
+                    self._gold_hist.setdefault(symbol, deque(maxlen=120)).append(quote.price)
+                    if prev is None:
+                        self._gold_hist[symbol].appendleft(quote.prev_close)
+                self._meta["gold_error"] = ""
+            elif remote_gold and attempted_gold:
+                self._meta["gold_error"] = gold_error or "上金所 Au99.99 获取失败"
+
+            for symbol, quote in manual_quotes.items():
+                self._quotes[symbol] = quote
+                self._gold_hist.setdefault(symbol, deque(maxlen=120)).append(quote.price)
+            for item in gold_items:
+                symbol = str(item["symbol"])
+                if symbol.startswith(GOLD_MANUAL_PREFIX) and symbol not in manual_quotes:
+                    self._quotes.pop(symbol, None)
+                    self._meta["gold_error"] = "手动价格未设置"
+
+            all_symbols = symbols + [str(item["symbol"]) for item in gold_items]
+            for symbol in all_symbols:
                 quote = self._quotes.get(symbol)
                 if not quote:
                     continue
                 if not quote.name:
-                    quote.name = self._names.get(symbol, "")
+                    item = next((i for i in gold_items if i["symbol"] == symbol), {})
+                    quote.name = (item.get("alias") or self._names.get(symbol, ""))
+                if str(symbol).startswith("gold:"):
+                    if str(symbol).startswith(GOLD_MANUAL_PREFIX):
+                        quote.stale = False
+                    elif attempted_gold:
+                        # 只有本轮真的请求过才判断异常；低频时段保留上次结论。
+                        quote.stale = (self._gold_failed
+                                       or (now - quote.updated_at) > self._stale_after)
+                    continue
+                if not want_stock:
+                    # 低频时段没有发请求，旧价格就是最近收盘价，不算异常。
+                    continue
                 missing = bool(quotes) and symbol not in quotes
                 quote.stale = (
                     quotes is None
@@ -946,7 +1266,7 @@ class MarketService:
             self._meta["names"] = {
                 symbol: (self._quotes.get(symbol).name if self._quotes.get(symbol) else "")
                           or self._names.get(symbol, "")
-                for symbol in symbols
+                for symbol in all_symbols
             }
             self._meta["version"] += 1
             current_error = self._meta["error"]
@@ -956,22 +1276,26 @@ class MarketService:
         if current_error and current_error != self._last_error:
             log("行情获取失败: " + current_error)
         self._last_error = current_error
+        if gold_error:
+            log("积存金参考价获取失败: " + gold_error)
 
-        # 分时数据单独刷新（比报价慢），失败时保留旧曲线
-        provider = used or providers[0]
-        for symbol in symbols:
-            if now - self._spark_at.get(symbol, 0) < self._intraday_every:
-                continue
-            try:
-                spark = provider.fetch_intraday(symbol)
-            except Exception as exc:
-                log(f"分时数据获取失败 {symbol}: {exc}")
-                self._spark_at[symbol] = now
-                continue
-            if spark and len(spark.points) >= 2:
-                with self._lock:
-                    self._sparks[symbol] = spark
+        # 分时数据单独刷新（比报价慢），失败时保留旧曲线；只在真正请求
+        # 股票行情的轮次里刷新，低频时段不额外发请求。
+        if symbols and want_stock:
+            provider = used or providers[0]
+            for symbol in symbols:
+                if now - self._spark_at.get(symbol, 0) < self._intraday_every:
+                    continue
+                try:
+                    spark = provider.fetch_intraday(symbol)
+                except Exception as exc:
+                    log(f"分时数据获取失败 {symbol}: {exc}")
                     self._spark_at[symbol] = now
+                    continue
+                if spark and len(spark.points) >= 2:
+                    with self._lock:
+                        self._sparks[symbol] = spark
+                        self._spark_at[symbol] = now
 
 
 def status_text(meta: dict) -> str:

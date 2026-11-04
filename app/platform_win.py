@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import threading
+import time
 from typing import Optional, Tuple
 
 from PIL import Image, ImageChops
@@ -372,6 +374,188 @@ def apply_no_activate(widget) -> None:
         _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- mouse hook
+WH_MOUSE_LL = 14
+WM_MOUSEMOVE = 0x0200
+WM_QUIT = 0x0012
+
+_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                               ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wt.POINT),
+        ("mouseData", wt.DWORD),
+        ("flags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+_set_hook = _user32.SetWindowsHookExW
+_set_hook.restype = wt.HANDLE
+_set_hook.argtypes = [ctypes.c_int, _HOOKPROC, wt.HINSTANCE, wt.DWORD]
+_unhook = _user32.UnhookWindowsHookEx
+_unhook.argtypes = [wt.HANDLE]
+_unhook.restype = wt.BOOL
+_next_hook = _user32.CallNextHookEx
+_next_hook.restype = ctypes.c_ssize_t
+_next_hook.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t]
+_get_module = _kernel32.GetModuleHandleW
+_get_module.restype = wt.HMODULE
+_get_module.argtypes = [wt.LPCWSTR]
+_get_tid = _kernel32.GetCurrentThreadId
+_get_tid.restype = wt.DWORD
+_post_thread = _user32.PostThreadMessageW
+_post_thread.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+_post_thread.restype = wt.BOOL
+_get_message = _user32.GetMessageW
+_get_message.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+_get_message.restype = ctypes.c_int
+_translate = _user32.TranslateMessage
+_translate.argtypes = [ctypes.POINTER(wt.MSG)]
+_dispatch = _user32.DispatchMessageW
+_dispatch.argtypes = [ctypes.POINTER(wt.MSG)]
+_dispatch.restype = ctypes.c_ssize_t
+
+
+class MouseHook:
+    """全局低级鼠标钩子（WH_MOUSE_LL），只在隐藏模式开启期间安装。
+
+    钩子运行在独立线程的消息循环里；回调应尽量轻量，只做矩形判断并投递事件。
+    鼠标静止时没有消息，CPU 占用接近 0；stop() 会卸载钩子并结束线程。
+    """
+
+    def __init__(self, on_move) -> None:
+        self._on_move = on_move
+        self._proc = None
+        self._thread = None
+        self._tid = 0
+        self._ready = threading.Event()
+        self._ok = False
+        self._err = 0
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    @property
+    def error(self) -> int:
+        return self._err
+
+    def start(self) -> bool:
+        if self._thread and self._thread.is_alive():
+            return self._ok
+        self._thread = threading.Thread(target=self._run, name="mouse-hook", daemon=True)
+        self._thread.start()
+        self._ready.wait(1.0)
+        return self._ok
+
+    def stop(self) -> None:
+        if not self._thread:
+            return
+        try:
+            if self._tid:
+                _user32.PostThreadMessageW(self._tid, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._thread = None
+        self._ok = False
+
+    def _run(self) -> None:
+        self._tid = int(_get_tid())
+        self._proc = _HOOKPROC(self._callback)
+        try:
+            handle = _set_hook(WH_MOUSE_LL, self._proc, _get_module(None), 0)
+        except Exception:
+            handle = None
+        if not handle:
+            self._err = int(_kernel32.GetLastError())
+            self._ok = False
+            self._ready.set()
+            return
+        self._ok = True
+        self._ready.set()
+        msg = wt.MSG()
+        try:
+            while True:
+                ret = _get_message(ctypes.byref(msg), None, 0, 0)
+                if ret == 0 or ret == -1:
+                    break
+                _translate(ctypes.byref(msg))
+                _dispatch(ctypes.byref(msg))
+        except Exception:
+            pass
+        try:
+            _unhook(handle)
+        except Exception:
+            pass
+
+    def _callback(self, n_code, w_param, l_param):
+        try:
+            if n_code >= 0 and w_param == WM_MOUSEMOVE:
+                info = ctypes.cast(l_param, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                self._on_move(int(info.pt.x), int(info.pt.y))
+        except Exception:
+            pass
+        return _next_hook(None, n_code, w_param, l_param)
+
+
+_busy_cache = (0.0, False)
+
+
+def desktop_busy() -> bool:
+    """全屏应用或锁屏时返回 True，隐藏模式的鼠标钩子应忽略这次移动。
+
+    判定：前台窗口矩形几乎铺满所在显示器，且不是桌面/任务栏本身；锁屏时
+    没有前台窗口。结果缓存 0.5 秒，避免每次鼠标移动都枚举窗口。
+    """
+    global _busy_cache
+    now = time.time()
+    if now - _busy_cache[0] < 0.5:
+        return _busy_cache[1]
+    busy = True
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if hwnd:
+            rect = window_rect(hwnd)
+            if rect:
+                mon = monitor_from_point((rect[0] + rect[2]) // 2,
+                                         (rect[1] + rect[3]) // 2)
+                if mon:
+                    m = mon["rect"]
+                    area = max(1, (m[2] - m[0]) * (m[3] - m[1]))
+                    covered = max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
+                    # 最大化窗口只占工作区（高度少一条任务栏），约 96%；真正的
+                    # 全屏/无边框全屏才会铺满整个显示器，阈值取 98% 可区分两者。
+                    # 任务栏自动隐藏时最大化窗口也能铺满，但带标题栏样式，不算全屏。
+                    style = int(_user32.GetWindowLongW(hwnd, -16) or 0)
+                    if covered < area * 0.98 or (style & 0x00C00000):
+                        busy = False
+                    else:
+                        buf = ctypes.create_unicode_buffer(256)
+                        _user32.GetClassNameW(hwnd, buf, 256)
+                        busy = buf.value not in (
+                            "Progman", "WorkerW", "Shell_TrayWnd",
+                            "Shell_SecondaryTrayWnd",
+                        )
+                else:
+                    busy = False
+            else:
+                busy = False
+        else:
+            busy = True          # 锁屏/切换用户时没有前台窗口
+    except Exception:
+        busy = False
+    _busy_cache = (now, busy)
+    return busy
 
 
 _MUTEX = None

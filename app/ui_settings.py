@@ -3,11 +3,20 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from typing import Callable
 
 from .config import CONFIG_PATH
-from .market import market_label, resolve_input, search_with_fallback, status_text
+from .market import (
+    GOLD_MANUAL_PREFIX,
+    GOLD_NOTE,
+    GOLD_SGE_SYMBOL,
+    market_label,
+    resolve_input,
+    search_with_fallback,
+    status_text,
+)
 from .platform_win import apply_tool_window
 from .ui_common import (
     AMBER,
@@ -170,7 +179,12 @@ class SettingsWindow:
         ops.pack(fill="x", pady=(px(6), 0))
         self._button(ops, "删除", self._remove_selected).pack(side="left", padx=(0, px(6)))
         self._button(ops, "上移", lambda: self._move(-1)).pack(side="left", padx=(0, px(6)))
-        self._button(ops, "下移", lambda: self._move(1)).pack(side="left")
+        self._button(ops, "下移", lambda: self._move(1)).pack(side="left", padx=(0, px(6)))
+        self._button(ops, "添加积存金", self._open_gold_dialog).pack(side="left")
+        self._label(left, "银行积存金无稳定公开报价，默认使用上金所 Au99.99 参考价并标注；"
+                    "也可手动填写固定价格。", 8, MUTED_DIM,
+                    wraplength=px(380), justify="left").pack(
+            anchor="w", pady=(px(4), 0))
 
         # ---- 右：设置
         right = tk.Frame(body, bg=PANEL_CARD, padx=px(14), pady=px(12), width=px(320))
@@ -301,7 +315,7 @@ class SettingsWindow:
 
         self.breadth_var = tk.BooleanVar(value=True)
         row = tk.Frame(right, bg=PANEL_CARD)
-        row.pack(fill="x", pady=(px(2), px(10)))
+        row.pack(fill="x", pady=(px(2), px(2)))
         tk.Checkbutton(
             row, text="显示涨跌家数（涨/跌/平）", variable=self.breadth_var,
             command=self._apply_options, bg=PANEL_CARD, fg=TEXT,
@@ -309,6 +323,34 @@ class SettingsWindow:
             activeforeground=TEXT, font=(FONT, px(10)), bd=0,
             highlightthickness=0,
         ).pack(side="left")
+
+        self.hidden_var = tk.BooleanVar(value=False)
+        row = tk.Frame(right, bg=PANEL_CARD)
+        row.pack(fill="x", pady=(px(2), px(2)))
+        tk.Checkbutton(
+            row, text="隐藏模式（鼠标移到贴靠热区才显示）", variable=self.hidden_var,
+            command=self._apply_options, bg=PANEL_CARD, fg=TEXT,
+            selectcolor="#15171d", activebackground=PANEL_CARD,
+            activeforeground=TEXT, font=(FONT, px(10)), bd=0,
+            highlightthickness=0,
+        ).pack(side="left")
+
+        self.hidden_delay_var = tk.StringVar(value="1.5")
+        self.hotspot_var = tk.StringVar(value="160")
+        for label, var, lo, hi, inc, tip in (
+            ("隐藏延时", self.hidden_delay_var, 0.5, 5.0, 0.5, "秒，移出后多久隐藏"),
+            ("热区宽度", self.hotspot_var, 60, 600, 20, "px，贴靠区域最小宽度"),
+        ):
+            row = tk.Frame(right, bg=PANEL_CARD)
+            row.pack(fill="x", pady=(0, px(6)))
+            self._label(row, label, 10, MUTED, width=8).pack(side="left")
+            tk.Spinbox(
+                row, from_=lo, to=hi, increment=inc, width=5, textvariable=var,
+                bg="#15171d", fg=TEXT, bd=0, relief="flat",
+                insertbackground=TEXT, font=(FONT, px(10)),
+                command=self._apply_options, buttonbackground="#2a2f3b",
+            ).pack(side="left")
+            self._label(row, tip, 8, MUTED_DIM).pack(side="left", padx=(px(8), 0))
 
         tk.Frame(right, bg="#2a2e38", height=1).pack(fill="x", pady=(px(4), px(10)))
         self._label(right, "提示：小组件默认贴靠托盘左侧；拖动后会按相对托盘的偏移记住。"
@@ -343,6 +385,9 @@ class SettingsWindow:
                               .get(cfg["data"]["provider"], "自动"))
         self.top_var.set(bool(cfg["window"]["always_on_top"]))
         self.breadth_var.set(bool(display.get("show_breadth", True)))
+        self.hidden_var.set(bool(display.get("hidden_mode", False)))
+        self.hidden_delay_var.set(str(display.get("hidden_delay", 1.5)))
+        self.hotspot_var.set(str(display.get("hotspot_width", 160)))
         self.scale_var.set(f"{int(round(float(cfg['window'].get('scale', 0.8)) * 100))}%")
         self._refresh_list()
 
@@ -355,17 +400,24 @@ class SettingsWindow:
         for item in self.store.cfg["watchlist"]:
             symbol = item["symbol"]
             quote = quotes.get(symbol)
+            kind = str(item.get("kind") or "stock")
             # 中文名优先级：用户别名 → 行情接口中文名 → 本地名称缓存 → 代码
             name = (item.get("alias") or (quote.name if quote else "")
                     or names.get(symbol) or symbol)
             name = self._short_name(name)
+            shown = self._display_symbol(symbol)
             if quote:
                 price = f"{quote.price:.2f}"
                 pct = f"{quote.change_pct:+.2f}%"
-                state = "离线" if quote.stale else ""
-                line = f"{symbol:<10} {name:<9} {price:>9}  {pct:>7}  {state}"
+                if kind == "gold":
+                    state = "手动" if symbol.startswith(GOLD_MANUAL_PREFIX) else "参考"
+                    if quote.stale:
+                        state += " 离线"
+                else:
+                    state = "离线" if quote.stale else ""
+                line = f"{shown:<12} {name:<9} {price:>9}  {pct:>7}  {state}"
             else:
-                line = f"{symbol:<10} {name:<9} {'—':>9}"
+                line = f"{shown:<12} {name:<9} {'—':>9}"
             self.listbox.insert("end", line)
         if index is not None and self.listbox.size() > 0:
             index = min(index, self.listbox.size() - 1)
@@ -375,6 +427,14 @@ class SettingsWindow:
     def _short_name(name: str, limit: int = 6) -> str:
         text = (name or "").strip()
         return text if len(text) <= limit else text[:limit] + "…"
+
+    @staticmethod
+    def _display_symbol(symbol: str) -> str:
+        if symbol == GOLD_SGE_SYMBOL:
+            return "gold:Au99.99"
+        if symbol.startswith(GOLD_MANUAL_PREFIX):
+            return "gold:手动"
+        return symbol
 
     # ------------------------------------------------------------------ 搜索
     def _local_name_map(self) -> dict:
@@ -523,6 +583,153 @@ class SettingsWindow:
         self._refresh_list()
         self.listbox.see("end")
 
+    # -------------------------------------------------------------- 积存金
+    def _open_gold_dialog(self) -> None:
+        gold_options = (
+            ("工商银行积存金（参考 Au99.99）", "工行积存金", "icbc"),
+            ("建设银行积存金（参考 Au99.99）", "建行积存金", "ccb"),
+            ("招商银行黄金账户（参考 Au99.99）", "招行黄金账户", "cmb"),
+            ("农业银行存金通（参考 Au99.99）", "农行存金通", "abc"),
+            ("上海黄金交易所 Au99.99（参考）", "Au99.99 参考", "sge"),
+            ("手动价格（自定义，元/克）", "自定义金价", "manual"),
+        )
+        dlg = tk.Toplevel(self.win)
+        dlg.title("添加积存金")
+        dlg.configure(bg=PANEL_BG)
+        dlg.transient(self.win)
+        dlg.geometry(f"{px(460)}x{px(390)}")
+        dlg.resizable(False, False)
+        body = tk.Frame(dlg, bg=PANEL_BG, padx=px(18), pady=px(14))
+        body.pack(fill="both", expand=True)
+
+        self._label(body, "添加积存金", 14, bold=True).pack(anchor="w")
+        self._label(body,
+                    "工行/建行/招行/农行积存金没有稳定公开报价接口，这里统一取"
+                    "上金所 Au99.99 参考价并标注「参考」；也可手动维护固定价格。",
+                    9, MUTED_DIM, wraplength=px(410), justify="left").pack(
+            anchor="w", pady=(px(2), px(10)))
+
+        choice = tk.StringVar(value=gold_options[0][0])
+        option = tk.OptionMenu(body, choice, *(o[0] for o in gold_options))
+        option.configure(bg="#15171d", fg=TEXT, bd=0, relief="flat",
+                         activebackground="#2a2f3b", highlightthickness=0,
+                         font=(FONT, px(10)), anchor="w")
+        option["menu"].configure(bg="#20232b", fg=TEXT, bd=0,
+                                 activebackground="#3a3f4c",
+                                 activeforeground="#ffffff",
+                                 font=(FONT, px(10)))
+        option.pack(fill="x", pady=(0, px(10)))
+
+        self._label(body, "手动价格（选择「手动价格」时填写）", 10, MUTED,
+                    bold=True).pack(anchor="w")
+        form = tk.Frame(body, bg=PANEL_BG)
+        form.pack(fill="x", pady=(px(4), px(8)))
+        name_var = tk.StringVar(value="自定义金价")
+        price_var = tk.StringVar(value="")
+        prev_var = tk.StringVar(value="")
+        for label, var, tip in (
+            ("名称", name_var, "显示在卡片上"),
+            ("现价", price_var, "元/克，如 865.80"),
+            ("昨收/上次", prev_var, "可选，用于计算涨跌幅"),
+        ):
+            row = tk.Frame(form, bg=PANEL_BG)
+            row.pack(fill="x", pady=(0, px(5)))
+            self._label(row, label, 10, MUTED, width=8).pack(side="left")
+            tk.Entry(row, textvariable=var, bg="#15171d", fg=TEXT, bd=0,
+                     relief="flat", insertbackground=TEXT,
+                     font=(FONT, px(10))).pack(side="left", fill="x",
+                                                        expand=True, ipady=px(4))
+            self._label(row, tip, 8, MUTED_DIM).pack(side="left", padx=(px(8), 0))
+
+        note = tk.Label(body, text=GOLD_NOTE, bg=PANEL_BG, fg=MUTED_DIM,
+                        font=(FONT, px(8)), anchor="w", wraplength=px(410),
+                        justify="left")
+        note.pack(fill="x", pady=(0, px(8)))
+        result = tk.Label(body, text="", bg=PANEL_BG, fg=AMBER,
+                          font=(FONT, px(9)), anchor="w", wraplength=px(410),
+                          justify="left")
+        result.pack(fill="x")
+
+        def submit() -> None:
+            picked = next((o for o in gold_options if o[0] == choice.get()),
+                          gold_options[0])
+            _label, alias, key = picked
+            if key == "manual":
+                try:
+                    price = float(price_var.get().strip())
+                except ValueError:
+                    result.configure(text="请填写有效的现价（元/克）")
+                    return
+                if price <= 0:
+                    result.configure(text="现价必须大于 0")
+                    return
+                try:
+                    prev = float(prev_var.get().strip()) if prev_var.get().strip() else 0.0
+                except ValueError:
+                    result.configure(text="昨收/上次价格格式不正确")
+                    return
+                alias = (name_var.get().strip() or "自定义金价")[:20]
+                self._save_manual_gold(alias, price, prev)
+            else:
+                self._save_sge_gold(alias, key)
+            self.app.apply_config(save=True)
+            self._refresh_list()
+            dlg.destroy()
+
+        buttons = tk.Frame(body, bg=PANEL_BG)
+        buttons.pack(fill="x", pady=(px(10), 0))
+        self._button(buttons, "添加", submit).pack(side="right")
+        self._button(buttons, "取消", dlg.destroy).pack(side="right", padx=(0, px(8)))
+        dlg.grab_set()
+
+    def _save_sge_gold(self, alias: str, key: str) -> None:
+        watchlist = self.store.cfg["watchlist"]
+        existing = next((i for i in watchlist if i["symbol"] == GOLD_SGE_SYMBOL), None)
+        if existing:
+            existing["alias"] = alias
+            existing["kind"] = "gold"
+            self.search_status.configure(
+                text=f"参考金价已在自选中，已更新名称为「{alias}」"
+                     + ("（银行积存金暂无公开报价）" if key != "sge" else ""),
+                fg=MUTED)
+            return
+        watchlist.append({
+            "symbol": GOLD_SGE_SYMBOL,
+            "alias": alias,
+            "kind": "gold",
+            "manual_price": 0,
+            "manual_prev": 0,
+            "manual_updated": 0,
+        })
+        self.search_status.configure(
+            text=f"已添加 {alias}（上金所 Au99.99 参考价，非该行积存金报价）",
+            fg=GREEN)
+
+    def _save_manual_gold(self, alias: str, price: float, prev: float) -> None:
+        watchlist = self.store.cfg["watchlist"]
+        stamp = time.time()
+        existing = next((i for i in watchlist
+                         if str(i.get("symbol") or "").startswith(GOLD_MANUAL_PREFIX)
+                         and (i.get("alias") or "") == alias), None)
+        if existing:
+            old_price = float(existing.get("manual_price") or 0)
+            if prev <= 0 and old_price > 0 and abs(old_price - price) > 1e-9:
+                prev = old_price          # 未填昨收时用上次价格，保持涨跌幅口径
+            existing.update({
+                "kind": "gold", "manual_price": price, "manual_prev": prev,
+                "manual_updated": stamp,
+            })
+            self.search_status.configure(
+                text=f"已更新 {alias} 手动价 {price:.2f} 元/克", fg=GREEN)
+            return
+        symbol = f"{GOLD_MANUAL_PREFIX}{int(stamp * 1000)}"
+        watchlist.append({
+            "symbol": symbol, "alias": alias, "kind": "gold",
+            "manual_price": price, "manual_prev": prev, "manual_updated": stamp,
+        })
+        self.search_status.configure(
+            text=f"已添加 {alias} 手动价 {price:.2f} 元/克（固定值）", fg=GREEN)
+
     def _add_candidate(self, index: int) -> None:
         if not (0 <= index < len(self._results)):
             return
@@ -565,6 +772,17 @@ class SettingsWindow:
             pass
         cfg["window"]["always_on_top"] = bool(self.top_var.get())
         cfg["display"]["show_breadth"] = bool(self.breadth_var.get())
+        cfg["display"]["hidden_mode"] = bool(self.hidden_var.get())
+        try:
+            cfg["display"]["hidden_delay"] = max(
+                0.5, min(5.0, float(self.hidden_delay_var.get())))
+        except ValueError:
+            pass
+        try:
+            cfg["display"]["hotspot_width"] = max(
+                60, min(600, int(float(self.hotspot_var.get()))))
+        except ValueError:
+            pass
         try:
             scale = float(self.scale_var.get().strip().rstrip("%")) / 100.0
         except ValueError:

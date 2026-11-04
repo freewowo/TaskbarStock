@@ -5,14 +5,18 @@ import json
 import time
 import tkinter as tk
 from collections import deque
+from datetime import datetime
 from typing import List, Optional
 
 from .config import RUNTIME_PATH
+from .market import GOLD_MANUAL_PREFIX, GOLD_NOTE
 from .platform_win import (
     LayeredSurface,
+    MouseHook,
     apply_no_activate,
     apply_tool_window,
     cursor_pos,
+    desktop_busy,
     hwnd_of_toplevel,
     monitor_from_point,
     monitors,
@@ -25,6 +29,8 @@ from .platform_win import (
 )
 from .ui_common import FONT_FAMILY, SCALE, palette, px
 from .ui_render import Frame, draw_arrow, draw_spark, text_width
+from .trading import calendar_info, status_for
+from .util import log
 
 TREND_W, TREND_H = 220, 40
 MINI_W, MINI_H = 104, 38
@@ -47,6 +53,9 @@ BREADTH_LABEL_FS = 10.5  # 涨/跌/平 标签（单字 CJK 在 8px 以下会糊�
 BREADTH_NUM_FS = 11.5   # 家数数字，与名称同级
 
 SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.6, 1.4, 0.1
+
+POPUP_W, POPUP_H = 232, 104
+STATUS_FS = 8.5
 
 
 class WidgetWindow:
@@ -83,6 +92,24 @@ class WidgetWindow:
         self._toast: Optional[tuple] = None
         self.surface: Optional[LayeredSurface] = None
 
+        # 隐藏模式
+        self._hidden = False
+        self._hook: Optional[MouseHook] = None
+        self._hide_at = 0.0
+        self._hook_inside = False
+        self._busy_since = 0.0
+        self._hidden_reason = ""
+        self._hover_zone = None
+        self._last_status_key = None
+        # 迷你详情浮层
+        self._popup = None
+        self._popup_sig = None
+        self._popup_at = 0.0
+        self._popup_leave_at = 0.0
+        self._popup_index = 0
+        self._last_click_at = 0.0
+        self._last_runtime_at = 0.0
+
         self.win = tk.Toplevel(app.root)
         self.win.withdraw()
         self.win.overrideredirect(True)
@@ -112,6 +139,8 @@ class WidgetWindow:
             ("<ButtonRelease-1>", self._on_release),
             ("<Button-3>", self._on_right_click),
             ("<MouseWheel>", self._on_wheel),
+            ("<Enter>", lambda _e: self.events.append("hover_enter")),
+            ("<Leave>", lambda _e: self.events.append("hover_leave")),
         ):
             self.hit.bind(seq, handler)
 
@@ -246,10 +275,13 @@ class WidgetWindow:
             raise_topmost(self.hit)
         self._render_now()
         self._write_runtime()
+        self._sync_hidden_mode(startup=True)
         self._tick()
 
     def destroy(self) -> None:
         self._close_menu()
+        self._close_popup()
+        self._stop_hook()
         for window in (self.hit, self.win):
             try:
                 window.destroy()
@@ -257,10 +289,10 @@ class WidgetWindow:
                 pass
 
     def _sync_hit(self, w: int, h: int) -> None:
-        """命中层与可见层保持同一矩形。"""
+        """命中层与可见层保持同一矩形；隐藏模式下不显示命中层。"""
         try:
             self.hit.geometry(f"{w}x{h}+{self._x}+{self._y}")
-            if self.hit.state() == "withdrawn":
+            if self.hit.state() == "withdrawn" and not self._hidden:
                 self.hit.deiconify()
         except Exception:
             pass
@@ -300,8 +332,10 @@ class WidgetWindow:
         self._size = (w, h)
         self._apply_geometry(w, h)
         self._pick_theme()
+        self._close_popup()
         self._render_now()
         self._write_runtime()
+        self._sync_hidden_mode()
 
     # ----------------------------------------------------------------- layout
     def _band(self) -> Optional[tuple]:
@@ -351,6 +385,8 @@ class WidgetWindow:
             if max_width > 0:
                 avail = min(avail, self._p(max_width))
             base_w = self.s(MINI_W if mode == "mini" else TREND_W)
+            if mode == "mini":
+                base_w += self._mini_status_extra()
             min_w = self.s(MIN_MINI_W if mode == "mini" else MIN_TREND_W)
             base_b = self.s(BREADTH_W)
             min_b = self.s(MIN_BREADTH_W)
@@ -416,6 +452,8 @@ class WidgetWindow:
         self._dock_ok = False
         self._count_limit = wanted
         self._card_w = self.s(MINI_W if mode == "mini" else TREND_W)
+        if mode == "mini":
+            self._card_w += self._mini_status_extra()
         self._breadth_w = self.s(BREADTH_W) if show_b else 0
         self._ch = self.s(base_h, 22)
 
@@ -527,6 +565,110 @@ class WidgetWindow:
         self._dark = dark
         self._pal = palette(dark)
 
+    # ------------------------------------------------------------ hidden mode
+    def _hot_rect(self) -> tuple:
+        """隐藏模式热区：贴靠时覆盖托盘左侧整条任务栏高度。"""
+        w, h = self._size
+        band = self._band()
+        if self._dock_ok and band:
+            _left, right, tb = band
+            width = max(w, self._p(float(self.cfg["display"].get("hotspot_width") or 160)))
+            return (right - width, tb[1], right + self._p(4), tb[3])
+        pad = self._p(6)
+        return (self._x - pad, self._y - pad, self._x + w + pad, self._y + h + pad)
+
+    def _visible_rect(self) -> tuple:
+        w, h = self._size
+        pad = self._p(3)
+        return (self._x - pad, self._y - pad, self._x + w + pad, self._y + h + pad)
+
+    @staticmethod
+    def _point_in(rect, x: int, y: int) -> bool:
+        return bool(rect) and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+    def _on_hook_move(self, x: int, y: int) -> None:
+        """WH_MOUSE_LL 回调（钩子线程）：只做判断，事件交给 Tk 线程。"""
+        if not bool(self.cfg["display"].get("hidden_mode")):
+            return
+        if desktop_busy():
+            # 全屏/锁屏期间先忽略移动；是否收起由主线程按“持续 busy”判断，
+            # 避免全屏判定瞬时抖动把刚显示的组件又藏起来。
+            return
+        rect = self._hot_rect() if self._hidden else self._visible_rect()
+        inside = self._point_in(rect, x, y)
+        if inside != self._hook_inside:
+            self._hook_inside = inside
+            self.events.append("hover_enter" if inside else "hover_leave")
+
+    def _sync_hidden_mode(self, startup: bool = False) -> None:
+        enabled = bool(self.cfg["display"].get("hidden_mode"))
+        was_on = bool(getattr(self, "_hidden_mode_on", False))
+        self._hidden_mode_on = enabled
+        if not enabled:
+            self._stop_hook()
+            if self._hidden:
+                self._set_hidden(False)
+            return
+        if self._hook is None:
+            self._hook = MouseHook(self._on_hook_move)
+            if not self._hook.start():
+                log(f"全局鼠标钩子安装失败(error={self._hook.error})，隐藏模式使用轮询兜底")
+                self._hook = None
+        if startup or not was_on:
+            self._set_hidden(True, "startup")
+
+    def _stop_hook(self) -> None:
+        hook = self._hook
+        self._hook = None
+        self._hook_inside = False
+        if hook is not None:
+            try:
+                hook.stop()
+            except Exception:
+                pass
+
+    def _paint_hidden(self) -> None:
+        """隐藏时提交全透明位图：窗口保留但不遮挡、不拦截任何点击。"""
+        if not self.surface:
+            return
+        try:
+            w, h = self._size
+            self.surface.update(Frame(w, h).image(), self._x, self._y)
+        except Exception:
+            pass
+
+    def _set_hidden(self, hidden: bool, reason: str = "") -> None:
+        if hidden == self._hidden:
+            return
+        self._hidden = hidden
+        self._hidden_reason = reason
+        self._hide_at = 0.0
+        self._busy_since = 0.0
+        if hidden:
+            self._close_menu()
+            self._close_popup()
+            try:
+                self.hit.withdraw()
+            except Exception:
+                pass
+            self._paint_hidden()
+        else:
+            self._last_sig = None
+            self._render_now()
+            self._sync_hit(*self._size)
+            now = time.time()
+            if now - getattr(self, "_last_show_refresh", 0.0) > 10.0:
+                # 重新显示组件时强制请求一次，避免隐藏期间数据过旧
+                self._last_show_refresh = now
+                try:
+                    self.app.service.refresh_now()
+                except Exception:
+                    pass
+            if self.cfg["window"]["always_on_top"]:
+                raise_topmost(self.win)
+                raise_topmost(self.hit)
+        self._write_runtime()
+
     # ----------------------------------------------------------------- events
     def post(self, event: str) -> None:
         self.events.append(event)
@@ -538,6 +680,17 @@ class WidgetWindow:
                 self.app.open_settings()
             elif event == "tray_right":
                 self._show_menu(*cursor_pos())
+            elif event == "hover_enter":
+                if bool(self.cfg["display"].get("hidden_mode")):
+                    self._hide_at = 0.0
+                    self._set_hidden(False)
+            elif event == "hover_leave":
+                if bool(self.cfg["display"].get("hidden_mode")) and not self._hidden:
+                    # 详情浮层打开期间保持可见：鼠标移到浮层上不算“离开组件”。
+                    if (self._drag is None and self._menu is None
+                            and self._popup is None):
+                        self._hide_at = time.time() + float(
+                            self.cfg["display"].get("hidden_delay") or 1.5)
 
     def _on_press(self, event) -> None:
         self._close_menu()
@@ -566,8 +719,19 @@ class WidgetWindow:
         if moved:
             self._adopt_drop_monitor()
             self._save_position()
-        else:
-            self.app.open_settings()
+            return
+        if self.cfg["display"]["mode"] == "mini":
+            # 迷你模式：单击展开详情，双击进入设置
+            now = time.time()
+            if now - self._last_click_at < 0.35:
+                self._last_click_at = 0.0
+                self._close_popup()
+                self.app.open_settings()
+            else:
+                self._last_click_at = now
+                self._show_popup(self._mini_click_index(event.x))
+            return
+        self.app.open_settings()
 
     def _adopt_drop_monitor(self) -> None:
         """松手时按组件中心所在屏幕重新选任务栏，并按该屏 DPI 重排尺寸。"""
@@ -802,6 +966,12 @@ class WidgetWindow:
             lambda v: self.app.set_display(rotate_enabled=(v == "on")),
         )
         add_group(
+            "隐藏模式",
+            (("on", "开启"), ("off", "关闭")),
+            "on" if bool(self.cfg["display"].get("hidden_mode", False)) else "off",
+            lambda v: self.app.set_display(hidden_mode=(v == "on")),
+        )
+        add_group(
             "数据源",
             (("auto", "自动"), ("tencent", "腾讯"), ("sina", "新浪")),
             self.cfg["data"]["provider"],
@@ -840,14 +1010,54 @@ class WidgetWindow:
     def _tick(self) -> None:
         try:
             self._drain_events()
+            self._hover_guard()
             self._maybe_rotate()
             self._ensure_geometry()
             self._render_now()
+            self._update_popup()
+            if time.time() - self._last_runtime_at > 5.0:
+                self._write_runtime()
         except Exception:
-            from .util import log
             log("小组件刷新异常", exc=True)
         finally:
-            self._tick_id = self.win.after(400, self._tick)
+            interval = 150 if bool(self.cfg["display"].get("hidden_mode")) else 400
+            self._tick_id = self.win.after(interval, self._tick)
+
+    def _hover_guard(self) -> None:
+        if not bool(self.cfg["display"].get("hidden_mode")):
+            return
+        hook_ok = self._hook is not None and self._hook.ok
+        busy = desktop_busy()
+        if self._hidden:
+            # 全屏应用/锁屏期间不因光标停在热区而弹出
+            if busy:
+                return
+            if not hook_ok and self._point_in(self._hot_rect(), *cursor_pos()):
+                self._set_hidden(False)
+            return
+        if busy:
+            # 持续 0.8s 仍处于全屏/锁屏才收起，避开切换窗口瞬间的误判。
+            if not self._busy_since:
+                self._busy_since = time.time()
+            if (time.time() - self._busy_since >= 0.8
+                    and self._drag is None and self._menu is None):
+                self._set_hidden(True, "busy")
+            return
+        self._busy_since = 0.0
+        if self._popup is not None:
+            self._hide_at = 0.0
+            return
+        if self._hide_at and time.time() >= self._hide_at:
+            if self._drag is None and self._menu is None:
+                self._set_hidden(True, "timeout")
+            else:
+                self._hide_at = 0.0
+        elif not hook_ok:
+            if self._point_in(self._visible_rect(), *cursor_pos()):
+                self._hide_at = 0.0
+            elif not self._hide_at:
+                self._hide_at = time.time() + float(
+                    self.cfg["display"].get("hidden_delay") or 1.5)
 
     @staticmethod
     def _layout_key(layout) -> tuple:
@@ -870,14 +1080,17 @@ class WidgetWindow:
             if size != self._size:
                 self._apply_geometry(*self._size)
                 self._last_sig = None
+                if self._hidden:
+                    self._paint_hidden()
         now = time.time()
         if now - self._last_geo_check < 2.0:
             return
         self._last_geo_check = now
         if self.cfg["window"]["always_on_top"]:
             # 每 tick 抢 z-order 会和拖动/合成打架，2 秒一次足够压住任务栏。
-            raise_topmost(self.win)
-            raise_topmost(self.hit)
+            if not self._hidden:
+                raise_topmost(self.win)
+                raise_topmost(self.hit)
             if self._menu is not None:
                 raise_topmost(self._menu)
         mon_changed = self._follow_monitor()
@@ -894,6 +1107,8 @@ class WidgetWindow:
             self._apply_geometry(w, h)
             self._last_sig = None
             self._pick_theme()
+            if self._hidden:
+                self._paint_hidden()
 
         if now - self._last_theme_check > 8.0:
             self._last_theme_check = now
@@ -912,7 +1127,7 @@ class WidgetWindow:
 
     def _render_now(self) -> None:
         # 拖动中冻结位图：Tk 只负责移动窗口，不再提交画面，松手后统一提交一次。
-        if self._drag is not None:
+        if self._drag is not None or self._hidden:
             return
         quotes, sparks, meta = self.app.service.snapshot()
         visible = self._compute_visible()
@@ -920,6 +1135,14 @@ class WidgetWindow:
         mode = self.cfg["display"]["mode"]
         breadth = meta.get("breadth") if self._show_breadth else None
         toast = self._toast_text()
+        now_dt = datetime.now()
+        status_keys = tuple(
+            (st.get("phase"), st.get("label"), bool(st.get("countdown")))
+            for st in (self._status_for(symbol, now_dt) for symbol in visible)
+        )
+        if mode == "mini" and status_keys != self._last_status_key:
+            self._last_status_key = status_keys
+            self._replan()
         signature = (
             meta.get("version"),
             tuple(visible),
@@ -940,14 +1163,19 @@ class WidgetWindow:
             quote = quotes.get(symbol)
             spark = sparks.get(symbol)
             points = spark.points if spark and spark.points else ()
+            status = self._status_for(symbol, now_dt)
             signature += (
                 symbol,
                 self._name_for(symbol, quote, meta),
                 round(quote.price, 3) if quote else None,
                 round(quote.change_pct, 3) if quote else None,
                 quote.stale if quote else True,
+                quote.source if quote else "",
                 len(points),
                 round(points[-1], 3) if points else None,
+                status.get("phase"),
+                status.get("label"),
+                status.get("countdown"),
             )
         if signature == self._last_sig:
             return
@@ -994,6 +1222,28 @@ class WidgetWindow:
             return name
         return (meta.get("names") or {}).get(symbol) or symbol
 
+    def _status_for(self, symbol: str, now: Optional[datetime] = None) -> dict:
+        if self.store.kind_of(symbol) == "gold":
+            return {"phase": "gold", "label": "", "countdown": ""}
+        return status_for("stock", now)
+
+    def _gold_tag(self, symbol: str, short: bool = False) -> str:
+        if self.store.kind_of(symbol) != "gold":
+            return ""
+        if symbol.startswith(GOLD_MANUAL_PREFIX):
+            return "手动"
+        return "参考" if short else "参考金价"
+
+    def _mini_status_extra(self) -> int:
+        """迷你卡在收盘/午休时给状态标签多留一点宽度（倒计时替代涨跌幅）。"""
+        symbols = self._visible or self.store.symbols()[:1]
+        if not symbols:
+            return 0
+        status = self._status_for(symbols[0])
+        if status.get("label") and not status.get("countdown"):
+            return int(text_width(status["label"], self._fs(STATUS_FS))) + self.s(6)
+        return 0
+
     def _fit(self, text: str, max_w: float, size: float, bold: bool = False) -> str:
         """按真实字体宽度截断，避免长名称撑破卡片。"""
         text = text or ""
@@ -1024,15 +1274,24 @@ class WidgetWindow:
         pending = quote is None and not meta.get("error")
         error = quote is None and bool(meta.get("error"))
         p = self._pal
+        tag = self._gold_tag(symbol, short=(mode == "mini"))
+        status = self._status_for(symbol)
+        tag_w = 0
+        if tag:
+            tag_w = text_width(tag, self._fs(STATUS_FS)) + self.s(6)
+            frame.text(x0 + cw - self.s(10), y0 + ch * 0.26, tag,
+                       self._fs(STATUS_FS), p["muted"], anchor="e")
 
         if stale and not pending:
-            frame.dot(x0 + cw - self.s(7), y0 + ch * 0.28,
+            frame.dot(x0 + cw - self.s(7) - tag_w, y0 + ch * 0.28,
                       max(1.6, self.s(1.8)), p["amber"])
 
         if mode == "mini":
-            self._draw_mini(frame, x0, y0, cw, ch, name, quote, pending, error)
+            self._draw_mini(frame, x0, y0, cw, ch, name, quote, pending, error,
+                            status, tag_w)
         else:
-            self._draw_trend(frame, x0, y0, cw, ch, name, quote, spark, pending, error)
+            self._draw_trend(frame, x0, y0, cw, ch, name, quote, spark, pending,
+                             error, status)
 
     def _price_text(self, quote) -> str:
         if not quote:
@@ -1047,7 +1306,7 @@ class WidgetWindow:
         return f"{quote.change_pct:+.2f}%"
 
     def _draw_trend(self, frame: Frame, x0, y0, cw, ch, name, quote, spark,
-                    pending, error) -> None:
+                    pending, error, status) -> None:
         p = self._pal
         color = self._dir_color(quote.change_pct) if quote else p["muted"]
         pad = self.s(10)
@@ -1059,7 +1318,11 @@ class WidgetWindow:
         # 现价与涨跌幅共用一个基线，字号不同也不会上下错位
         base_y = self._baseline(y0, ch)
 
-        name = self._fit(name, cw - self.s(46), name_size)
+        countdown = str((status or {}).get("countdown") or "")
+        countdown_text = f"距开盘 {countdown}" if countdown else ""
+        countdown_w = (text_width(countdown_text, self._fs(STATUS_FS)) + self.s(8)
+                       if countdown_text else 0)
+        name = self._fit(name, cw - self.s(46) - countdown_w, name_size)
         frame.text(left, name_y, name, name_size,
                    p["name"] if quote else p["dim"])
 
@@ -1068,15 +1331,27 @@ class WidgetWindow:
 
         text = self._pct_text(quote)
         pct_w = 0.0
+        pct_x = left
         if text:
             price_w = text_width(price, price_size, True)
             pct_x = left + price_w + self.s(6)
             pct_w = text_width(text, pct_size)
             frame.text(pct_x, base_y, text, pct_size, color, anchor="ls")
 
+        label = str((status or {}).get("label") or "")
+        label_w = 0.0
+        if label and quote:
+            label_size = self._fs(STATUS_FS)
+            label_x = pct_x + pct_w + self.s(4)
+            frame.text(label_x, base_y, label, label_size, p["muted"], anchor="ls")
+            label_w = text_width(label, label_size) + self.s(4)
+        if countdown_text and not pending and not error:
+            frame.text(x0 + cw - pad, name_y, countdown_text,
+                       self._fs(STATUS_FS), p["amber"], anchor="e")
+
         spark_right = x0 + cw - pad
-        spark_left = max(left + text_width(price, price_size, True) + pct_w + self.s(10),
-                         x0 + cw * 0.50)
+        spark_left = max(left + text_width(price, price_size, True) + pct_w + label_w
+                         + self.s(10), x0 + cw * 0.50)
         if spark_right - spark_left >= self.s(22):
             if spark and len(spark.points) >= 2:
                 prev = spark.prev_close or (quote.prev_close if quote else 0)
@@ -1100,15 +1375,15 @@ class WidgetWindow:
         return y0 + ch - max(3, self.s(3))
 
     def _draw_mini(self, frame: Frame, x0, y0, cw, ch, name, quote,
-                   pending, error) -> None:
-        """迷你模式：只画「名称 + 涨跌幅」，不画走势线，也不带涨跌家数。"""
+                   pending, error, status, tag_w: float = 0) -> None:
+        """迷你模式：只画「名称 + 涨跌幅」；非交易时段追加状态或开盘倒计时。"""
         p = self._pal
         pad = self.s(8)
         left = x0 + pad
         name_size = self._fs(NAME_FS)
         pct_size = self._fs(MINI_PCT_FS)
         base_y = self._baseline(y0, ch)
-        name = self._fit(name, cw - pad * 2, name_size)
+        name = self._fit(name, cw - pad * 2 - tag_w, name_size)
         frame.text(left, y0 + ch * 0.26, name, name_size,
                    p["name"] if quote else p["dim"])
 
@@ -1119,14 +1394,25 @@ class WidgetWindow:
             frame.text(left, base_y, "离线", self._fs(10), p["amber"], anchor="ls")
             return
 
+        countdown = str((status or {}).get("countdown") or "")
+        if countdown:
+            frame.text(left, base_y, f"距开盘 {countdown}", self._fs(9.5),
+                       p["amber"], bold=True, anchor="ls")
+            return
+
         color = self._dir_color(quote.change_pct)
         if quote.change_pct != 0:
             # 三角与涨跌幅数字的光学中心对齐（数字高约 0.7em）
             draw_arrow(frame, left + self.s(5), base_y - pct_size * 0.34,
                        quote.change_pct > 0, color, max(2.5, 4.4 * self.scale))
         text_x = left + (self.s(14) if quote.change_pct != 0 else 0)
-        frame.text(text_x, base_y, self._pct_text(quote), pct_size,
-                   color, bold=True, anchor="ls")
+        pct_text = self._pct_text(quote)
+        frame.text(text_x, base_y, pct_text, pct_size, color, bold=True, anchor="ls")
+        label = str((status or {}).get("label") or "")
+        if label:
+            label_size = self._fs(STATUS_FS)
+            label_x = text_x + text_width(pct_text, pct_size, True) + self.s(3)
+            frame.text(label_x, base_y, label, label_size, p["muted"], anchor="ls")
 
     def _draw_breadth(self, frame: Frame, x0, y0, cw, ch, breadth) -> None:
         """上涨/下跌/平盘家数三列；无数据时显示“—”，失败保留旧值加琥珀点。"""
@@ -1135,6 +1421,9 @@ class WidgetWindow:
         num_size = self._fs(BREADTH_NUM_FS)
         up_color = p["red"] if self.cfg["display"]["color_style"] == "cn" else p["green"]
         down_color = p["green"] if self.cfg["display"]["color_style"] == "cn" else p["red"]
+        status_label = str(status_for("stock").get("label") or "")
+        status_size = self._fs(7.5)
+        status_w = (text_width(status_label, status_size) if status_label else 0.0)
         columns = (
             ("涨", up_color, breadth.get("up") if breadth else None),
             ("跌", down_color, breadth.get("down") if breadth else None),
@@ -1144,6 +1433,9 @@ class WidgetWindow:
         base_y = self._baseline(y0, ch)
         for index, (label, color, value) in enumerate(columns):
             cx = x0 + col_w * (index + 0.5)
+            if status_label and index == 2:
+                # 给右上角状态标签让出宽度，避免“平已收盘”挤在一起
+                cx -= (status_w + self.s(3)) / 2.0
             frame.text(cx, y0 + ch * 0.28, label, max(7.5, label_size),
                        color if value is not None else p["dim"], anchor="center")
             number = "—" if value is None else f"{value}"
@@ -1151,13 +1443,231 @@ class WidgetWindow:
             frame.text(cx, base_y, number, num_size,
                        color if value is not None else p["dim"],
                        bold=True, anchor="ms")
+        if status_label:
+            frame.text(x0 + cw - self.s(2), y0 + ch * 0.28, status_label,
+                       status_size, p["muted"], anchor="e")
         if breadth and breadth.get("stale"):
-            frame.dot(x0 + cw - self.s(5), y0 + ch * 0.22,
+            frame.dot(x0 + cw - self.s(5), y0 + ch * 0.78,
                       max(1.6, self.s(1.8)), p["amber"])
+
+    # ---------------------------------------------------------- mini popup
+    def _mini_click_index(self, event_x: int) -> int:
+        cw, _ch = self._card_size()
+        step = max(1, cw + self.s(GAP, 2))
+        index = max(0, int(event_x) // step)
+        return min(index, max(0, len(self._visible) - 1))
+
+    def _show_popup(self, index: int = 0) -> None:
+        if self.cfg["display"]["mode"] != "mini" or not self._visible:
+            return
+        self._popup_index = max(0, min(index, len(self._visible) - 1))
+        self._popup_at = time.time() + 4.0
+        self._popup_leave_at = 0.0
+        if self._popup is None:
+            self._create_popup()
+        self._popup_sig = None
+        self._update_popup(force=True)
+        self._write_runtime()
+
+    def _create_popup(self) -> None:
+        self._close_popup()
+        win = tk.Toplevel(self.app.root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg="#000000")
+        win.attributes("-topmost", True)
+        hit = tk.Toplevel(self.app.root)
+        hit.withdraw()
+        hit.overrideredirect(True)
+        hit.configure(bg="#000000")
+        hit.attributes("-topmost", True)
+        try:
+            hit.attributes("-alpha", 0.004)
+        except Exception:
+            pass
+        apply_tool_window(win)
+        apply_no_activate(win)
+        apply_tool_window(hit)
+        apply_no_activate(hit)
+        hit.bind("<Enter>", lambda _e: self._popup_enter())
+        hit.bind("<Leave>", lambda _e: self._popup_leave())
+        hit.bind("<Button-1>", lambda _e: self._close_popup())
+        surface = LayeredSurface(hwnd_of_toplevel(win))
+        self._popup = {"win": win, "hit": hit, "surface": surface}
+
+    def _popup_enter(self) -> None:
+        if self._popup:
+            self._popup_at = time.time() + 4.0
+            self._popup_leave_at = 0.0
+
+    def _popup_leave(self) -> None:
+        if self._popup:
+            self._popup_leave_at = time.time() + 0.8
+
+    def _close_popup(self) -> None:
+        state = self._popup
+        self._popup = None
+        self._popup_sig = None
+        self._popup_leave_at = 0.0
+        if not state:
+            return
+        for key in ("hit", "win"):
+            try:
+                state[key].destroy()
+            except Exception:
+                pass
+        # 浮层关闭时如果鼠标已不在组件上，补一次隐藏倒计时（隐藏模式下
+        # 浮层打开期间故意不隐藏，关闭后需要恢复自动收起）。
+        if (bool(self.cfg["display"].get("hidden_mode")) and not self._hidden
+                and self._drag is None and self._menu is None
+                and not self._point_in(self._visible_rect(), *cursor_pos())):
+            self._hide_at = time.time() + float(
+                self.cfg["display"].get("hidden_delay") or 1.5)
+        self._write_runtime()
+
+    def _popup_pos(self, pw: int, ph: int) -> tuple:
+        cw, _ch = self._card_size()
+        gap = self.s(GAP, 2)
+        index = max(0, min(self._popup_index, max(0, len(self._visible) - 1)))
+        cx = self._x + index * (cw + gap) + cw // 2
+        x = cx - pw // 2
+        band = self._band()
+        layout = self._layout or {}
+        if self._dock_ok and band and layout.get("orientation") == "top":
+            y = layout["rect"][3] + self.s(8)
+        elif self._dock_ok and band:
+            y = layout["rect"][1] - ph - self.s(8)
+        else:
+            y = self._y - ph - self.s(8)
+        if self._mon:
+            left, top, right, bottom = self._mon["work"]
+        else:
+            left, top, right, bottom = work_area()
+        x = max(left + self.s(6), min(x, right - pw - self.s(6)))
+        if y < top + self.s(4) or y + ph > bottom - self.s(4):
+            y = min(max(top + self.s(4), y), bottom - ph - self.s(4))
+        return int(x), int(y)
+
+    def _update_popup(self, force: bool = False) -> None:
+        if not self._popup:
+            return
+        if self.cfg["display"]["mode"] != "mini":
+            self._close_popup()
+            return
+        now = time.time()
+        if self._popup_leave_at and now >= self._popup_leave_at:
+            self._close_popup()
+            return
+        if now >= self._popup_at:
+            self._close_popup()
+            return
+        visible = self._visible or self._compute_visible()
+        if not visible:
+            self._close_popup()
+            return
+        symbol = visible[min(self._popup_index, len(visible) - 1)]
+        quotes, sparks, meta = self.app.service.snapshot()
+        quote = quotes.get(symbol)
+        spark = sparks.get(symbol)
+        pw, ph = self.s(POPUP_W), self.s(POPUP_H, 40)
+        x, y = self._popup_pos(pw, ph)
+        status = self._status_for(symbol)
+        points = spark.points if spark and spark.points else ()
+        signature = (
+            symbol, self._name_for(symbol, quote, meta),
+            round(quote.price, 3) if quote else None,
+            round(quote.change_pct, 3) if quote else None,
+            quote.stale if quote else True, quote.source if quote else "",
+            len(points), round(points[-1], 3) if points else None,
+            status.get("phase"), status.get("label"), status.get("countdown"),
+            self.scale, self._dark, pw, ph,
+        )
+        state = self._popup
+        if signature == self._popup_sig and not force:
+            if (state["win"].winfo_x(), state["win"].winfo_y()) != (x, y):
+                state["win"].geometry(f"{pw}x{ph}+{x}+{y}")
+                state["hit"].geometry(f"{pw}x{ph}+{x}+{y}")
+            return
+        self._popup_sig = signature
+
+        frame = Frame(pw, ph)
+        self._draw_popup(frame, pw, ph, symbol, quote, spark, meta, status)
+        try:
+            state["win"].geometry(f"{pw}x{ph}+{x}+{y}")
+            state["hit"].geometry(f"{pw}x{ph}+{x}+{y}")
+            state["win"].update_idletasks()
+            state["surface"].update(frame.image(), x, y)
+            if state["win"].state() == "withdrawn":
+                state["win"].deiconify()
+            if state["hit"].state() == "withdrawn":
+                state["hit"].deiconify()
+            raise_topmost(state["win"])
+            raise_topmost(state["hit"])
+        except Exception:
+            log("迷你详情浮层渲染失败", exc=True)
+
+    def _draw_popup(self, frame: Frame, pw, ph, symbol, quote, spark, meta, status) -> None:
+        p = self._pal
+        # 浮层悬浮在桌面/窗口之上，必须有实底，否则文字会与下方内容叠在一起。
+        radius = self.s(8)
+        frame.rounded_rect(0.5, 0.5, pw - 0.5, ph - 0.5,
+                           "#3a4152" if self._dark else "#d8dbe3", radius)
+        frame.rounded_rect(1.5, 1.5, pw - 1.5, ph - 1.5,
+                           "#1b1e26" if self._dark else "#f4f5f8", radius - 1)
+        pad = self.s(12)
+        name = self._name_for(symbol, quote, meta)
+        color = self._dir_color(quote.change_pct) if quote else p["muted"]
+        tag = self._gold_tag(symbol)
+        unit = "元/克" if self.store.kind_of(symbol) == "gold" else ""
+        tag_text = " · ".join(t for t in (tag, unit) if t)
+        status_label = str((status or {}).get("label") or "")
+        countdown = str((status or {}).get("countdown") or "")
+
+        right_text = tag_text
+        if countdown:
+            right_text = f"距开盘 {countdown}"
+        right_w = text_width(right_text, self._fs(9), True) + self.s(8)
+        name_text = self._fit(name, pw - pad * 2 - right_w, self._fs(12))
+        frame.text(pad, ph * 0.18, name_text, self._fs(12), p["name"], bold=True)
+        if right_text:
+            frame.text(pw - pad, ph * 0.18, right_text, self._fs(9),
+                       p["amber"] if countdown else p["muted"], anchor="e")
+
+        price = self._price_text(quote)
+        price_size = self._fs(20)
+        base_y = ph * 0.52
+        frame.text(pad, base_y, price, price_size, color, bold=True, anchor="ls")
+        pct_text = self._pct_text(quote)
+        if pct_text:
+            pct_x = pad + text_width(price, price_size, True) + self.s(8)
+            frame.text(pct_x, base_y, pct_text, self._fs(11), color, anchor="ls")
+            if status_label:
+                frame.text(pct_x + text_width(pct_text, self._fs(11)) + self.s(4),
+                           base_y, status_label, self._fs(STATUS_FS),
+                           p["muted"], anchor="ls")
+        if quote and not quote.stale:
+            frame.text(pw - pad, base_y, quote.quote_time or "",
+                       self._fs(8), p["dim"], anchor="rs")
+        elif quote is not None:
+            frame.text(pw - pad, base_y, "数据异常", self._fs(8), p["amber"], anchor="rs")
+
+        box = (pad, ph * 0.62, pw - pad, ph - self.s(8))
+        if spark and len(spark.points) >= 2:
+            prev = spark.prev_close or (quote.prev_close if quote else 0)
+            draw_spark(frame, box, spark.points, prev, color, p["guide"],
+                       width=max(1.0, 1.2 * self.scale))
+        else:
+            mid = (box[1] + box[3]) / 2
+            frame.dashed(box[0], mid, box[2], mid, p["guide"],
+                         width=max(1.0, self.scale))
+            if self.store.kind_of(symbol) == "gold":
+                frame.text(pw / 2, mid, GOLD_NOTE, self._fs(8), p["dim"],
+                           anchor="center")
 
     # ---------------------------------------------------------------- runtime
     def _write_runtime(self) -> None:
         try:
+            self._last_runtime_at = time.time()
             w, h = self._size
             _quotes, _sparks, meta = self.app.service.snapshot()
             payload = {
@@ -1182,6 +1692,33 @@ class WidgetWindow:
                 "show_breadth": bool(self._show_breadth),
                 "names": meta.get("names") or {},
                 "breadth": meta.get("breadth"),
+                "hidden_mode": bool(self.cfg["display"].get("hidden_mode")),
+                "hidden": bool(self._hidden),
+                "hidden_reason": getattr(self, "_hidden_reason", ""),
+                "desktop_busy": desktop_busy(),
+                "mouse": list(cursor_pos()),
+                "hotzone": list(self._hot_rect()),
+                "popup": ({"symbol": (self._visible[min(self._popup_index,
+                                                       len(self._visible) - 1)]
+                            if self._visible else ""),
+                           "open": True} if self._popup else None),
+                "status": {symbol: self._status_for(symbol)
+                            for symbol in (self._visible or [])},
+                "gold_error": meta.get("gold_error") or "",
+                "adaptive": meta.get("adaptive") or {},
+                "poll_log": (meta.get("poll_log") or [])[-20:],
+                "gold": {
+                    symbol: {
+                        "price": quote.price,
+                        "change_pct": round(quote.change_pct, 3),
+                        "time": quote.quote_time,
+                        "source": quote.source,
+                        "stale": quote.stale,
+                    }
+                    for symbol, quote in _quotes.items()
+                    if str(symbol).startswith("gold:")
+                },
+                "calendar": calendar_info(),
                 "pid": __import__("os").getpid(),
             }
             RUNTIME_PATH.write_text(json.dumps(payload, ensure_ascii=False),

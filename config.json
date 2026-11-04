@@ -10,7 +10,10 @@
     "show_breadth": true,
     "rotate_enabled": true,
     "rotate_seconds": 10,
-    "color_style": "cn"
+    "color_style": "cn",
+    "hidden_mode": false,
+    "hidden_delay": 1.5,
+    "hotspot_width": 160
   },
   "data": {
     "provider": "auto",

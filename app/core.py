@@ -10,6 +10,7 @@ from .icon import ensure_icon
 from .market import MarketService
 from .platform_win import work_area
 from .tray import TrayIcon
+from .trading import CALENDAR
 from .ui_common import Fonts, px, pick_font_family
 from .ui_settings import SettingsWindow
 from .ui_widget import WidgetWindow
@@ -29,6 +30,10 @@ class App:
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
+        try:
+            CALENDAR.ensure_refresh()
+        except Exception:
+            log("交易日历刷新失败", exc=True)
         self.service.start()
         self.widget = WidgetWindow(self)
         self.widget.show()
@@ -55,6 +60,10 @@ class App:
 
     # --------------------------------------------------------------- settings
     def open_settings(self) -> None:
+        try:
+            self.service.refresh_now()
+        except Exception:
+            pass
         if self.settings is None:
             self.settings = SettingsWindow(self)
         self.settings.show()

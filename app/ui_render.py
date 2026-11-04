@@ -110,6 +110,15 @@ class Frame:
                        (x0 + ux * end, y0 + uy * end)), color, width)
             start += dash + gap
 
+    def rounded_rect(self, x0: float, y0: float, x1: float, y1: float,
+                     color: str, radius: float = 6.0) -> None:
+        """填充圆角矩形（浮层底板用）。"""
+        draw = ImageDraw.Draw(self._mask(color))
+        r = max(0.0, radius) * SS
+        draw.rounded_rectangle(
+            (x0 * SS, y0 * SS, x1 * SS, y1 * SS), radius=r, fill=255
+        )
+
     def dot(self, cx: float, cy: float, radius: float, color: str) -> None:
         draw = ImageDraw.Draw(self._mask(color))
         r = max(1.0, radius) * SS
