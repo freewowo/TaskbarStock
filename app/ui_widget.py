@@ -567,35 +567,39 @@ class WidgetWindow:
 
     # ------------------------------------------------------------ hidden mode
     def _hot_rect(self) -> tuple:
-        """隐藏模式热区：贴靠时覆盖托盘左侧整条任务栏高度。"""
+        """隐藏模式热区：每次都由当前窗口真实矩形推导。
+
+        不能用启动时缓存的任务栏锚点：拖动/缩放/换屏后窗口的 _x/_y/_size
+        都会变，热区必须跟着窗口走。贴靠任务栏时纵向覆盖整条任务栏高度，
+        其余位置按窗口上下各留一点余量。
+        """
         w, h = self._size
+        pad = self._p(4)
+        width = max(w, self._p(float(self.cfg["display"].get("hotspot_width") or 160)))
         band = self._band()
         if self._dock_ok and band:
-            _left, right, tb = band
-            width = max(w, self._p(float(self.cfg["display"].get("hotspot_width") or 160)))
-            return (right - width, tb[1], right + self._p(4), tb[3])
-        pad = self._p(6)
-        return (self._x - pad, self._y - pad, self._x + w + pad, self._y + h + pad)
-
-    def _visible_rect(self) -> tuple:
-        w, h = self._size
-        pad = self._p(3)
-        return (self._x - pad, self._y - pad, self._x + w + pad, self._y + h + pad)
+            tb = band[2]
+            if tb[1] <= self._y and self._y + h <= tb[3]:
+                return (self._x - (width - w), tb[1], self._x + w + pad, tb[3])
+        return (self._x - (width - w), self._y - pad, self._x + w + pad, self._y + h + pad)
 
     @staticmethod
     def _point_in(rect, x: int, y: int) -> bool:
         return bool(rect) and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
 
     def _on_hook_move(self, x: int, y: int) -> None:
-        """WH_MOUSE_LL 回调（钩子线程）：只做判断，事件交给 Tk 线程。"""
+        """WH_MOUSE_LL 回调（钩子线程）：只做判断，事件交给 Tk 线程。
+
+        显示/隐藏都用同一个热区做边界，避免 0 延时下光标停在热区边缘
+        时“显示→离开→再显示”的闪烁。
+        """
         if not bool(self.cfg["display"].get("hidden_mode")):
             return
         if desktop_busy():
             # 全屏/锁屏期间先忽略移动；是否收起由主线程按“持续 busy”判断，
             # 避免全屏判定瞬时抖动把刚显示的组件又藏起来。
             return
-        rect = self._hot_rect() if self._hidden else self._visible_rect()
-        inside = self._point_in(rect, x, y)
+        inside = self._point_in(self._hot_rect(), x, y)
         if inside != self._hook_inside:
             self._hook_inside = inside
             self.events.append("hover_enter" if inside else "hover_leave")
@@ -645,6 +649,8 @@ class WidgetWindow:
         self._hide_at = 0.0
         self._busy_since = 0.0
         if hidden:
+            # 重新隐藏后，下一次移动进入热区要能立刻触发显示
+            self._hook_inside = False
             self._close_menu()
             self._close_popup()
             try:
@@ -689,8 +695,17 @@ class WidgetWindow:
                     # 详情浮层打开期间保持可见：鼠标移到浮层上不算“离开组件”。
                     if (self._drag is None and self._menu is None
                             and self._popup is None):
-                        self._hide_at = time.time() + float(
-                            self.cfg["display"].get("hidden_delay") or 1.5)
+                        delay = self._hide_delay()
+                        if delay <= 0:
+                            self._set_hidden(True, "leave")
+                        else:
+                            self._hide_at = time.time() + delay
+
+    def _hide_delay(self) -> float:
+        try:
+            return max(0.0, float(self.cfg["display"].get("hidden_delay") or 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _on_press(self, event) -> None:
         self._close_menu()
@@ -1020,7 +1035,7 @@ class WidgetWindow:
         except Exception:
             log("小组件刷新异常", exc=True)
         finally:
-            interval = 150 if bool(self.cfg["display"].get("hidden_mode")) else 400
+            interval = 100 if bool(self.cfg["display"].get("hidden_mode")) else 400
             self._tick_id = self.win.after(interval, self._tick)
 
     def _hover_guard(self) -> None:
@@ -1044,20 +1059,22 @@ class WidgetWindow:
                 self._set_hidden(True, "busy")
             return
         self._busy_since = 0.0
-        if self._popup is not None:
+        if (self._popup is not None or self._drag is not None
+                or self._menu is not None):
             self._hide_at = 0.0
             return
         if self._hide_at and time.time() >= self._hide_at:
-            if self._drag is None and self._menu is None:
-                self._set_hidden(True, "timeout")
-            else:
-                self._hide_at = 0.0
-        elif not hook_ok:
-            if self._point_in(self._visible_rect(), *cursor_pos()):
-                self._hide_at = 0.0
-            elif not self._hide_at:
-                self._hide_at = time.time() + float(
-                    self.cfg["display"].get("hidden_delay") or 1.5)
+            self._set_hidden(True, "timeout")
+            return
+        if self._point_in(self._hot_rect(), *cursor_pos()):
+            self._hide_at = 0.0
+            return
+        # 即使钩子正常也做一次兜底：钩子事件丢失/光标瞬移时仍能及时收起。
+        delay = self._hide_delay()
+        if delay <= 0:
+            self._set_hidden(True, "leave")
+        elif not self._hide_at:
+            self._hide_at = time.time() + delay
 
     @staticmethod
     def _layout_key(layout) -> tuple:
@@ -1520,9 +1537,12 @@ class WidgetWindow:
         # 浮层打开期间故意不隐藏，关闭后需要恢复自动收起）。
         if (bool(self.cfg["display"].get("hidden_mode")) and not self._hidden
                 and self._drag is None and self._menu is None
-                and not self._point_in(self._visible_rect(), *cursor_pos())):
-            self._hide_at = time.time() + float(
-                self.cfg["display"].get("hidden_delay") or 1.5)
+                and not self._point_in(self._hot_rect(), *cursor_pos())):
+            delay = self._hide_delay()
+            if delay <= 0:
+                self._set_hidden(True, "leave")
+            else:
+                self._hide_at = time.time() + delay
         self._write_runtime()
 
     def _popup_pos(self, pw: int, ph: int) -> tuple:

@@ -12,7 +12,8 @@
     "rotate_seconds": 10,
     "color_style": "cn",
     "hidden_mode": false,
-    "hidden_delay": 1.5,
+    "hidden_delay": 0.0,
+    "hidden_delay_version": 1,
     "hotspot_width": 160
   },
   "data": {

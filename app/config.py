@@ -68,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
         "rotate_seconds": 10,          # 轮播间隔，0 = 不轮播
         "color_style": "cn",           # cn=红涨绿跌（A股习惯），intl=绿涨红跌
         "hidden_mode": False,          # 隐藏模式：平时不可见，鼠标进贴靠热区才显示
-        "hidden_delay": 1.5,           # 移出热区后自动隐藏的延时（秒）
+        "hidden_delay": 0.0,           # 移出热区后自动隐藏的延时（秒），0=立即
         "hotspot_width": 160,          # 隐藏模式热区最小宽度（物理像素）
     },
     "data": {
@@ -195,6 +195,7 @@ class ConfigStore:
         self.path = CONFIG_PATH
         self.cfg: Dict[str, Any] = {}
         self.first_run = False
+        self._migrated = False
         self.load()
 
     # ------------------------------------------------------------------ load
@@ -214,6 +215,8 @@ class ConfigStore:
             self.first_run = True
         self.cfg = _deep_merge(DEFAULTS, raw)
         self._sanitize()
+        if self._migrated:
+            self.save()
 
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
@@ -271,8 +274,16 @@ class ConfigStore:
         if display.get("color_style") not in ("cn", "intl"):
             display["color_style"] = "cn"
         display["hidden_mode"] = bool(display.get("hidden_mode", False))
+        # 0.2.0 的默认延时是 1.5s；升级到 0.2.1 时把旧默认值迁成 0（立即隐藏），
+        # 用户手选过的其它值（如 2.5）保留。
+        if int(display.get("hidden_delay_version") or 0) < 1:
+            legacy = _clamp_float(display.get("hidden_delay"), 0.0, 5.0, 1.5)
+            if abs(legacy - 1.5) < 0.001:
+                display["hidden_delay"] = 0.0
+            display["hidden_delay_version"] = 1
+            self._migrated = True
         display["hidden_delay"] = round(
-            _clamp_float(display.get("hidden_delay"), 0.5, 5.0, 1.5), 2)
+            _clamp_float(display.get("hidden_delay"), 0.0, 5.0, 0.0), 2)
         display["hotspot_width"] = _clamp(
             display.get("hotspot_width"), 60, 600, 160)
 

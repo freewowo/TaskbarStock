@@ -335,10 +335,10 @@ class SettingsWindow:
             highlightthickness=0,
         ).pack(side="left")
 
-        self.hidden_delay_var = tk.StringVar(value="1.5")
+        self.hidden_delay_var = tk.StringVar(value="0")
         self.hotspot_var = tk.StringVar(value="160")
         for label, var, lo, hi, inc, tip in (
-            ("隐藏延时", self.hidden_delay_var, 0.5, 5.0, 0.5, "秒，移出后多久隐藏"),
+            ("隐藏延时", self.hidden_delay_var, 0.0, 5.0, 0.5, "秒，0=立即隐藏"),
             ("热区宽度", self.hotspot_var, 60, 600, 20, "px，贴靠区域最小宽度"),
         ):
             row = tk.Frame(right, bg=PANEL_CARD)
@@ -386,7 +386,7 @@ class SettingsWindow:
         self.top_var.set(bool(cfg["window"]["always_on_top"]))
         self.breadth_var.set(bool(display.get("show_breadth", True)))
         self.hidden_var.set(bool(display.get("hidden_mode", False)))
-        self.hidden_delay_var.set(str(display.get("hidden_delay", 1.5)))
+        self.hidden_delay_var.set(str(display.get("hidden_delay", 0)))
         self.hotspot_var.set(str(display.get("hotspot_width", 160)))
         self.scale_var.set(f"{int(round(float(cfg['window'].get('scale', 0.8)) * 100))}%")
         self._refresh_list()
@@ -775,9 +775,10 @@ class SettingsWindow:
         cfg["display"]["hidden_mode"] = bool(self.hidden_var.get())
         try:
             cfg["display"]["hidden_delay"] = max(
-                0.5, min(5.0, float(self.hidden_delay_var.get())))
+                0.0, min(5.0, float(self.hidden_delay_var.get())))
         except ValueError:
             pass
+        cfg["display"]["hidden_delay_version"] = 1
         try:
             cfg["display"]["hotspot_width"] = max(
                 60, min(600, int(float(self.hotspot_var.get()))))

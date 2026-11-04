@@ -238,40 +238,47 @@ def poll_interval(base: float, has_stock: bool = True, has_gold: bool = False,
                   now: _dt.datetime | None = None) -> dict:
     """按交易状态给出轮询间隔与下一次唤醒时刻。
 
-    基准是用户设置的盘中间隔（默认 3 秒）；午休/盘前 5 分钟，收盘后 30 分钟，
-    非交易日 60 分钟。积存金参考价按上金所日盘/夜盘 15 秒、其余时段 5 分钟。
-    实际睡眠还会被“下一次状态切换时刻”截断，保证 09:30 / 13:00 秒级恢复。
+    0.2.1 起 A 股只在盘中（用户基准间隔）和开盘前 5 分钟定时请求；
+    午间休市、收盘后、非交易日不再周期请求，仅在状态切换时由调用方补 1 次。
+    积存金参考价仍按上金所日盘/夜盘 30 秒、其余 5 分钟更新（混排时也保留）。
+    睡眠还会被“下一次状态切换时刻”截断，保证 09:30 / 13:00 秒级恢复。
     """
     now = now or _dt.datetime.now()
     base = max(1.0, float(base))
     stock = CALENDAR.status("stock", now)
     phase = stock["phase"]
+    stock_active = False
+    stock_interval = 0.0
+    wake_hint = None
     if phase == "trading":
+        stock_active = True
         stock_interval = base
     elif phase == "preopen":
         remain = max(0.0, (CALENDAR.next_open(now) - now).total_seconds())
-        stock_interval = base if remain <= 300 else 300.0
-    elif phase == "lunch":
-        stock_interval = 300.0
-    elif phase == "closed":
-        stock_interval = 1800.0
-    else:
-        stock_interval = 3600.0
+        if remain <= 300:
+            stock_active = True
+            stock_interval = base
+        else:
+            # 距离 09:25（开盘前 5 分钟）还有多久；此前完全停止请求
+            wake_hint = max(0.0, remain - 300)
 
     gold_every = gold_interval(now)
-    intervals = []
-    if has_stock:
-        intervals.append(stock_interval)
+    hints = []
+    if has_stock and stock_active:
+        hints.append(stock_interval)
+    if has_stock and wake_hint is not None:
+        hints.append(wake_hint)
     if has_gold:
-        intervals.append(gold_every)
-    interval = min(intervals) if intervals else 3600.0
+        hints.append(gold_every)
     boundary = next_boundary(now)
-    until = max(0.0, (boundary - now).total_seconds())
-    sleep = min(interval, until)
+    until = max(0.2, (boundary - now).total_seconds())
+    interval = min(hints) if hints else until
+    sleep = min(interval, until) if hints else until
     return {
         "phase": phase,
         "gold_session": gold_session(now),
-        "stock_interval": round(stock_interval, 3) if has_stock else 0,
+        "stock_interval": round(stock_interval, 3) if stock_active else 0,
+        "stock_active": bool(has_stock and stock_active),
         "gold_interval": round(gold_every, 3) if has_gold else 0,
         "interval": round(interval, 3),
         "sleep": round(sleep, 3),

@@ -823,6 +823,7 @@ class MarketService:
         self._gold_every = 30
         self._gold_failed = False
         self._stock_at = 0.0
+        self._phase_prev: Optional[str] = None
         self._force = threading.Event()
         self._poll_log: deque = deque(maxlen=60)
         self._adaptive: dict = {}
@@ -835,7 +836,6 @@ class MarketService:
         self._breadth: Optional[dict] = None
         self._breadth_error = ""
         self._breadth_at = 0.0
-        self._breadth_every = 15.0
         self._breadth_session = _new_session()
         self._breadth_session.headers.update(UA_EASTMONEY)
         self._meta = {
@@ -1086,13 +1086,8 @@ class MarketService:
             plan = self._plan()
             with self._lock:
                 self._adaptive = plan
-                self._poll_log.append({
-                    "time": time.strftime("%H:%M:%S"),
-                    "phase": plan["phase"],
-                    "interval": plan["interval"],
-                })
             if plan["phase"] != last_phase:
-                log(f"自适应刷新: {plan['phase']} 间隔 {plan['interval']:.0f}s，"
+                log(f"自适应刷新: {plan['phase']}，唤醒 {plan['sleep']:.0f}s，"
                     f"下次约 {plan['next_at']}")
                 last_phase = plan["phase"]
             try:
@@ -1104,7 +1099,7 @@ class MarketService:
             plan = self._plan()
             if self._stop.is_set():
                 break
-            self._wake.wait(plan["sleep"])
+            self._wake.wait(max(0.05, plan["sleep"]))
             self._wake.clear()
         log("行情轮询线程退出")
 
@@ -1116,30 +1111,34 @@ class MarketService:
         force = self._force.is_set()
         if force:
             self._force.clear()
-        phase = self._plan()["phase"]
-        # 涨跌家数与股票同属 A 股时段：收盘后 30 分钟、非交易日 60 分钟一次。
-        self._breadth_every = {
-            "trading": 15.0, "preopen": 300.0, "lunch": 300.0,
-            "closed": 1800.0,
-        }.get(phase, 3600.0)
+        stock_plan = poll_interval(self._interval, True, False)
+        phase = stock_plan["phase"]
+        # 进入新状态（盘前→开盘、午休→开盘、收盘等）补一次请求，
+        # 拿到最新价后即可停摆，不再按分钟级轮询。
+        transition = self._phase_prev != phase
+        self._phase_prev = phase
         self._gold_every = current_gold_interval()
 
-        # 涨跌家数不需要 3 秒一刷，降低频率可避免东财风控直接断开连接
-        breadth = None
-        if force or now - self._breadth_at >= self._breadth_every:
+        # 涨跌家数与股票同属 A 股时段：只在盘中按 15s 刷新；
+        # 其余时段仅在状态切换/手动刷新时请求一次。
+        breadth_attempted = (
+            force or transition
+            or (phase == "trading" and now - self._breadth_at >= 15.0)
+        )
+        breadth = self._fetch_breadth() if breadth_attempted else None
+        if breadth_attempted:
             self._breadth_at = now
-            breadth = self._fetch_breadth()
         with self._lock:
             if breadth:
                 breadth["updated_at"] = now
                 breadth["stale"] = False
                 self._breadth = breadth
                 self._meta["breadth_error"] = ""
-            elif self._breadth:
+            elif breadth_attempted and self._breadth:
                 # 失败不清空旧值：保留数字并标 stale，UI 显示琥珀点
                 self._breadth["stale"] = True
                 self._meta["breadth_error"] = self._breadth_error
-            else:
+            elif breadth_attempted:
                 self._meta["breadth_error"] = self._breadth_error
 
         if not symbols and not gold_items:
@@ -1150,11 +1149,13 @@ class MarketService:
             self._save_names()
             return
 
-        # 轮询循环按“股票/积存金/涨跌家数”里最短的间隔醒来；每类标的再按
-        # 自己的时段判断本轮是否真的发请求，收盘后股票不会跟着黄金每 15 秒刷。
-        stock_plan = poll_interval(self._interval, True, False)
+        # 股票：盘中按用户间隔；开盘前 5 分钟恢复高频；午休/收盘/非交易日
+        # 只在状态切换时请求 1 次，之后完全停止（积存金仍按自身时段更新）。
         want_stock = bool(symbols) and (
-            force or now - self._stock_at >= stock_plan["interval"])
+            force or transition
+            or (stock_plan["stock_active"]
+                and now - self._stock_at >= stock_plan["interval"])
+        )
         if want_stock:
             self._stock_at = now
 
@@ -1296,6 +1297,17 @@ class MarketService:
                     with self._lock:
                         self._sparks[symbol] = spark
                         self._spark_at[symbol] = now
+
+        with self._lock:
+            self._poll_log.append({
+                "time": time.strftime("%H:%M:%S"),
+                "phase": phase,
+                "stock": bool(symbols and want_stock),
+                "breadth": bool(breadth_attempted),
+                "gold": bool(attempted_gold),
+                "transition": bool(transition),
+                "force": bool(force),
+            })
 
 
 def status_text(meta: dict) -> str:
