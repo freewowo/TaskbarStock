@@ -5,6 +5,11 @@ import os
 import tkinter as tk
 from typing import Optional
 
+from .autostart import (
+    set_enabled as set_autostart_enabled,
+    state as read_autostart_state,
+    sync as sync_autostart,
+)
 from .config import CONFIG_PATH, ICON_PATH, ConfigStore
 from .icon import ensure_icon
 from .market import MarketService
@@ -30,6 +35,7 @@ class App:
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
+        self._sync_autostart()
         try:
             CALENDAR.ensure_refresh()
         except Exception:
@@ -39,6 +45,18 @@ class App:
         self.widget.show()
         self._start_tray()
         log("小组件已启动")
+
+    def _sync_autostart(self) -> None:
+        """以注册表为准同步配置镜像，并修复 exe 被移动后遗留的旧路径。"""
+        try:
+            before = bool(self.cfg.get("system", {}).get("autostart", False))
+            st = sync_autostart(self.cfg)
+            if st.get("error"):
+                log(f"开机自启动：{st['error']}")
+            if bool(self.cfg.get("system", {}).get("autostart", False)) != before:
+                self.store.save()
+        except Exception:
+            log("开机自启动状态同步失败", exc=True)
 
     def _start_tray(self) -> None:
         accent = self._accent_rgb()
@@ -84,6 +102,26 @@ class App:
     def set_provider(self, provider: str) -> None:
         self.cfg["data"]["provider"] = provider
         self.apply_config(save=True)
+
+    # ------------------------------------------------------------- autostart
+    def autostart_state(self) -> dict:
+        """读取当前真实的自启动状态（注册表），供界面显示。"""
+        try:
+            return read_autostart_state()
+        except Exception:
+            log("读取开机自启动状态失败", exc=True)
+            return {"supported": False, "enabled": False, "error": "状态读取失败"}
+
+    def set_autostart(self, enabled: bool) -> tuple[bool, str]:
+        """开关自启动。注册表写入成功后才更新配置；失败时保留原状态。"""
+        ok, msg = set_autostart_enabled(enabled)
+        if ok:
+            self.cfg.setdefault("system", {})["autostart"] = bool(enabled)
+            self.store.save()
+            log(f"开机自启动：{msg}")
+        else:
+            log(f"开机自启动设置失败：{msg}")
+        return ok, msg
 
     def reset_position(self) -> None:
         if not self.widget:

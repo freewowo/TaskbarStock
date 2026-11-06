@@ -23,6 +23,9 @@
     "stale_after_seconds": 30,
     "intraday_refresh_seconds": 60
   },
+  "system": {
+    "autostart": false
+  },
   "window": {
     "offset_x": 0,
     "offset_y": 0,

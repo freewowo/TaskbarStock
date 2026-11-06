@@ -9,6 +9,7 @@ import sys
 import tkinter as tk
 import traceback
 
+from app.autostart import is_startup_launch
 from app.config import ConfigStore
 from app.core import App
 from app.platform_win import enable_dpi_awareness, single_instance_lock
@@ -62,6 +63,8 @@ def main() -> int:
     if not single_instance_lock():
         # 已有实例在运行：静默退出，避免出现两个小组件
         return 0
+    if is_startup_launch():
+        log("本次由开机自启动拉起")
 
     store = ConfigStore()
     root = tk.Tk()

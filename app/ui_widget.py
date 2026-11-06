@@ -882,6 +882,17 @@ class WidgetWindow:
             except Exception:
                 pass
 
+    def _on_autostart_pick(self, value: str) -> None:
+        ok, msg = self.app.set_autostart(value == "on")
+        if ok:
+            self._set_toast(msg)
+        else:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("开机自启动", msg, parent=self.app.root)
+            except Exception:
+                pass
+
     def _show_menu(self, x: int, y: int) -> None:
         """自绘右键菜单（原生菜单在 NOACTIVATE 窗口里不会自动收起）。"""
         self._close_menu()
@@ -985,6 +996,12 @@ class WidgetWindow:
             (("on", "开启"), ("off", "关闭")),
             "on" if bool(self.cfg["display"].get("hidden_mode", False)) else "off",
             lambda v: self.app.set_display(hidden_mode=(v == "on")),
+        )
+        add_group(
+            "开机自启动",
+            (("on", "开启"), ("off", "关闭")),
+            "on" if self.app.autostart_state().get("enabled") else "off",
+            self._on_autostart_pick,
         )
         add_group(
             "数据源",
@@ -1712,6 +1729,7 @@ class WidgetWindow:
                 "show_breadth": bool(self._show_breadth),
                 "names": meta.get("names") or {},
                 "breadth": meta.get("breadth"),
+                "autostart": bool(self.cfg.get("system", {}).get("autostart", False)),
                 "hidden_mode": bool(self.cfg["display"].get("hidden_mode")),
                 "hidden": bool(self._hidden),
                 "hidden_reason": getattr(self, "_hidden_reason", ""),

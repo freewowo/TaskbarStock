@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 from typing import Callable
 
 from .config import CONFIG_PATH
@@ -39,8 +40,9 @@ class SettingsWindow:
         self.win = tk.Toplevel(app.root)
         self.win.title("任务栏股票小组件 · 设置")
         self.win.configure(bg=PANEL_BG)
-        self.win.geometry(f"{px(760)}x{px(680)}")
-        self.win.minsize(px(700), px(620))
+        # 750 才能完整容纳右栏设置 + 底部按钮行（内容最小需求约 740）
+        self.win.geometry(f"{px(760)}x{px(750)}")
+        self.win.minsize(px(700), px(700))
         self.win.protocol("WM_DELETE_WINDOW", self.hide)
         self._refreshing = False
         # 名称搜索：300ms 防抖 + 后台线程 + 队列回主线程，避免阻塞设置界面
@@ -304,6 +306,7 @@ class SettingsWindow:
         option.pack(side="left")
 
         self.top_var = tk.BooleanVar(value=True)
+        self.autostart_var = tk.BooleanVar(value=False)
         row = tk.Frame(right, bg=PANEL_CARD)
         row.pack(fill="x", pady=(px(2), px(2)))
         tk.Checkbutton(
@@ -312,6 +315,16 @@ class SettingsWindow:
             activebackground=PANEL_CARD, activeforeground=TEXT,
             font=(FONT, px(10)), bd=0, highlightthickness=0,
         ).pack(side="left")
+        tk.Checkbutton(
+            row, text="开机自启动", variable=self.autostart_var,
+            command=self._on_autostart_toggle,
+            bg=PANEL_CARD, fg=TEXT, selectcolor="#15171d",
+            activebackground=PANEL_CARD, activeforeground=TEXT,
+            font=(FONT, px(10)), bd=0, highlightthickness=0,
+        ).pack(side="left", padx=(px(10), 0))
+        self.autostart_label = self._label(right, "", 8, MUTED_DIM,
+                                           wraplength=px(280), justify="left")
+        self.autostart_label.pack(anchor="w", pady=(0, px(4)))
 
         self.breadth_var = tk.BooleanVar(value=True)
         row = tk.Frame(right, bg=PANEL_CARD)
@@ -389,6 +402,8 @@ class SettingsWindow:
         self.hidden_delay_var.set(str(display.get("hidden_delay", 0)))
         self.hotspot_var.set(str(display.get("hotspot_width", 160)))
         self.scale_var.set(f"{int(round(float(cfg['window'].get('scale', 0.8)) * 100))}%")
+        self.autostart_var.set(bool(cfg.get("system", {}).get("autostart", False)))
+        self._refresh_autostart_status()
         self._refresh_list()
 
     def _refresh_list(self) -> None:
@@ -747,6 +762,32 @@ class SettingsWindow:
         self.search_status.configure(
             text=f"已添加 {name or code} · {code} · {market}", fg=GREEN)
 
+    # ------------------------------------------------------------- autostart
+    def _refresh_autostart_status(self, error: str = "") -> None:
+        """以注册表为准刷新勾选框与状态文字，兼容任务管理器里的外部改动。"""
+        st = self.app.autostart_state()
+        self.autostart_var.set(bool(st.get("enabled")))
+        msg = error or st.get("error") or ""
+        if msg:
+            text, color = msg, AMBER
+        elif not st.get("supported", True):
+            text, color = "开机自启动：仅 Windows 可用", MUTED_DIM
+        elif st.get("blocked"):
+            text, color = "开机自启动：已被任务管理器「启动应用」禁用", AMBER
+        elif st.get("enabled"):
+            text, color = "开机自启动：已启用 · 仅当前用户，无需管理员", GREEN
+        else:
+            text, color = "开机自启动：未启用 · 登录 Windows 后自动运行", MUTED_DIM
+        self.autostart_label.configure(text=text, fg=color)
+
+    def _on_autostart_toggle(self) -> None:
+        wanted = bool(self.autostart_var.get())
+        ok, msg = self.app.set_autostart(wanted)
+        # 失败时把勾选框还原成注册表的真实状态，避免界面与系统不一致
+        self._refresh_autostart_status("" if ok else msg)
+        if not ok:
+            messagebox.showerror("开机自启动", msg, parent=self.win)
+
     def _collect(self) -> None:
         cfg = self.store.cfg
         cfg["display"]["mode"] = self.mode_var.get()
@@ -869,6 +910,7 @@ class SettingsWindow:
     # -------------------------------------------------------------- visibility
     def show(self) -> None:
         self._refresh_list()
+        self._refresh_autostart_status()
         self.win.deiconify()
         # 设置窗也不进任务栏按钮区，避免它的按钮把小组件挤窄
         apply_tool_window(self.win)

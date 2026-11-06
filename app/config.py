@@ -78,6 +78,10 @@ DEFAULTS: Dict[str, Any] = {
         "stale_after_seconds": 30,
         "intraday_refresh_seconds": 60,
     },
+    "system": {
+        # 开机自启动的镜像值；真实状态以注册表的 HKCU Run 项为准（见 autostart.py）
+        "autostart": False,
+    },
     "window": {
         # 相对“托盘左侧默认落点”的偏移，拖动后按此记忆
         "offset_x": 0,
@@ -296,6 +300,9 @@ class ConfigStore:
         data["intraday_refresh_seconds"] = _clamp(
             data.get("intraday_refresh_seconds"), 10, 900, 60
         )
+
+        system = cfg.setdefault("system", {})
+        system["autostart"] = bool(system.get("autostart", False))
 
         win = cfg.setdefault("window", {})
         # 第一版用绝对坐标 x/y，这里迁移为相对托盘的偏移，避免旧值干扰

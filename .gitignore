@@ -20,3 +20,6 @@ data/stockbar.log
 check_edge_light.png
 compare_rotate.png
 compare_glitch.png
+
+# 本地 AI 助手工作数据（记忆/会话，不入库）
+.workbuddy/

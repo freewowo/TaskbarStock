@@ -1,3 +1,47 @@
+# TaskbarStock v0.2.2
+
+2026-11-06。新增「开机自启动」开关，并重新打包单文件 exe。
+
+## 新增功能
+
+- **设置窗开关**：「显示设置」新增「开机自启动」勾选框，与「窗口置顶」同行；下方一行实时显示「已启用 / 未启用 / 已被任务管理器禁用 / 错误原因」。
+- **右键菜单开关**：小组件右键菜单新增「开机自启动 → 开启 / 关闭」分组，切换后以浮层提示结果。
+- **即时生效**：勾选后直接写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `TaskbarStock` 值（REG_SZ），命令为带引号的 exe 绝对路径 + `--startup`；取消勾选即删除该值。仅当前用户，不需要管理员权限，也不写启动文件夹 / 计划任务 / HKLM。
+- **注册表为准**：`system.autostart` 是配置里的镜像值。任务管理器「启动应用」里禁用后，界面显示禁用状态、程序不擅自改回；程序内重新开启会清掉 `StartupApproved\Run` 的禁用标记。
+- **路径自愈**：exe 被移动或改名后，手动启动一次即把启动项改写到当前 exe 路径。
+- **失败兜底**：注册表不可写时勾选框还原、弹窗提示、写日志，配置保持原状态；`runtime.json` 增加 `autostart` 字段，启动日志区分「本次由开机自启动拉起」。
+- 源码运行（未打包）时，启动命令使用 `pythonw.exe` + `main.py` 绝对路径，避免开机弹出控制台窗口。
+
+## 变更文件
+
+- 新增 `app/autostart.py`（注册表读写、状态查询、配置镜像与路径修复）。
+- `app/config.py` / `config.json`：新增 `system.autostart`（默认 `false`），旧配置自动补齐。
+- `app/core.py` / `main.py`：启动时同步状态，提供 `set_autostart` / `autostart_state`，记录自启动来源日志。
+- `app/ui_settings.py` / `app/ui_widget.py`：设置窗控件与右键菜单分组；设置窗默认高度调为 750、最小高度 700，顺带修复原先底部「保存并应用」按钮行被压缩到 9px 的裁剪问题。
+- `README.md` / `RELEASE_NOTES.md`：功能、配置、打包与限制说明。
+
+## 验证
+
+- 隔离测试（临时注册表值名，不触碰真实启动项）：初始未启用 → 开启后 `enabled=true` 且命令与当前路径一致 → 配置镜像为 `true` → 人为写入过期路径后 `sync()` 自动修复 → 关闭后值被删除、镜像回 `false`，全部通过。
+- 设置窗冒烟测试（Tk 构建、勾选切换、状态文案、保存并应用链路）通过。
+- `compileall` 全量语法检查通过；exe 按 `TaskbarStock.spec` 重新构建，产物 `dist/TaskbarStock.exe`。
+- 冻结环境探针（另建临时 PyInstaller 构建）确认：打包后 `winreg` 可用（Python 3.14 内建）、Tk 8.6 可用、`main` 及各模块导入正常、`FROZEN=True` 时启动命令指向 exe 绝对路径、注册表开/关均成功并已清理测试项。
+- 测试全程使用临时注册表值名，未改动真实的 `TaskbarStock` 启动项（保持默认「未启用」）。
+
+## 发布产物
+
+- `dist/TaskbarStock.exe` — 37.0 MiB（38,794,189 字节），x64 单文件、GUI 无控制台。
+- SHA256：`fb9adf40182295652d8561d2fa3a88b3ebdec56719a48825af7fabe65fedc0ce`
+- 构建环境：CPython 3.14.0（含 tkinter）、Pillow 12.0.0、PyInstaller 6.22.2。
+
+## 配置
+
+```jsonc
+"system": { "autostart": false }   // 镜像值；真实状态以注册表为准
+```
+
+---
+
 # TaskbarStock v0.2.1
 
 2026-11-04。0.2.1 修复隐藏模式两个问题，并把非交易时段的轮询改为“停止请求”。
